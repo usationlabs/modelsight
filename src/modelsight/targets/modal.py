@@ -90,7 +90,7 @@ def run(exp: Experiment, config_text: str, run_name: str) -> Path:
                 print(f"warning: could not commit results volume: {exc}", flush=True)
 
     try:
-        with app.run():
+        with modal.enable_output(), app.run():
             remote.remote(asdict(exp), config_text, run_name)
     except RunError:
         _download(volume, run_name, local_dir)
