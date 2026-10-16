@@ -10,7 +10,7 @@ import typer
 
 from modelsight import __version__
 from modelsight.config import ConfigError, Experiment, load_experiment
-from modelsight.runner import RunError
+from modelsight.runner import RunError, aiperf_status
 from modelsight.targets import local, modal
 
 app = typer.Typer(
@@ -83,6 +83,11 @@ def run(
         typer.echo(dry_run_report(experiment, config, name))
         return
 
+    aiperf = aiperf_status(experiment)
+    if aiperf.startswith("not found"):
+        typer.echo(f"error: aiperf {aiperf}", err=True)
+        raise typer.Exit(1)
+
     target = local if experiment.target == "local" else modal
     try:
         run_dir = target.run(experiment, config_text, name)
@@ -111,6 +116,7 @@ def dry_run_report(exp: Experiment, config: Path, name: str) -> str:
         f"timeout: {exp.timeout}",
         f"server: {exp.server}",
         f"bench: {exp.bench}",
+        f"aiperf: {aiperf_status(exp)}",
     ]
     return "\n".join(lines)
 

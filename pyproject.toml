@@ -1,7 +1,7 @@
 [project]
 name = "modelsight"
 version = "0.1.0"
-description = "Run SGLang and AIPerf experiments on a local GPU machine or on Modal."
+description = "Run AIPerf experiments on a local GPU machine or on Modal."
 readme = "PLAN.md"
 requires-python = ">=3.12"
 dependencies = [

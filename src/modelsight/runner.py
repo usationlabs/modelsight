@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -80,6 +82,22 @@ def execute_run(exp: Experiment, run_dir: Path, config_text: str) -> None:
         print("stopping server", flush=True)
         stop_process(server)
         server_log.close()
+
+
+def aiperf_status(exp: Experiment) -> str:
+    """Where `aiperf` will come from, or why it will not be found."""
+    try:
+        words = shlex.split(exp.bench)
+    except ValueError:
+        words = []
+    if not words or Path(words[0]).name != "aiperf":
+        return "not used by this bench command"
+    if exp.target == "modal":
+        return "installed in the Modal image"
+    found = shutil.which("aiperf")
+    if found:
+        return f"found at {found}"
+    return "not found on PATH (install it with: uv tool install aiperf)"
 
 
 def environment_report(image: str | None) -> str:
