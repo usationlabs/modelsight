@@ -54,3 +54,33 @@ def test_version() -> None:
     result = runner.invoke(app, ["version"])
     assert result.exit_code == 0
     assert result.stdout.strip()
+
+
+def _local_experiment(tmp_path: Path, bench: str) -> Path:
+    path = tmp_path / "exp.yaml"
+    path.write_text(f"target: local\nserver: sleep 1\nbench: {bench}\n")
+    return path
+
+
+def test_dry_run_reports_missing_aiperf(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path))
+    config = _local_experiment(tmp_path, "aiperf profile")
+    result = runner.invoke(app, ["run", "-f", str(config), "--dry-run"])
+    assert result.exit_code == 0
+    assert "aiperf: not found on PATH" in result.stdout
+
+
+def test_run_stops_before_launching_when_aiperf_is_missing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path))
+    config = _local_experiment(tmp_path, "aiperf profile")
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["run", "-f", str(config)])
+    assert result.exit_code == 1
+    assert "uv tool install aiperf" in result.output
+    assert not (tmp_path / "results").exists()
+
+
+def test_dry_run_skips_check_for_other_bench_tools(tmp_path: Path) -> None:
+    config = _local_experiment(tmp_path, "echo hi")
+    result = runner.invoke(app, ["run", "-f", str(config), "--dry-run"])
+    assert "aiperf: not used by this bench command" in result.stdout
