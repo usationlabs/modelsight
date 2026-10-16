@@ -5,10 +5,13 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import IO
 
 from modelsight import __version__
 from modelsight.config import Experiment
@@ -47,7 +50,9 @@ def execute_run(exp: Experiment, run_dir: Path, config_text: str) -> None:
     (run_dir / "env.txt").write_text(environment_report(exp.image))
 
     deadline = time.monotonic() + exp.timeout_seconds
-    server, server_log = start_process(exp.server, run_dir / "server.log", cwd=Path.cwd())
+    server, server_log = start_process(
+        exp.server, run_dir / "server.log", cwd=Path.cwd(), prefix="[server] "
+    )
     bench = None
     bench_log = None
     try:
@@ -60,7 +65,9 @@ def execute_run(exp: Experiment, run_dir: Path, config_text: str) -> None:
             overall_deadline=deadline,
         )
         print("server is ready, starting bench", flush=True)
-        bench, bench_log = start_process(exp.bench, run_dir / "bench.log", cwd=run_dir)
+        bench, bench_log = start_process(
+            exp.bench, run_dir / "bench.log", cwd=run_dir, prefix="[bench] "
+        )
         wait_for_exit(bench, deadline, exp.timeout)
         if bench.returncode != 0:
             raise RunError(f"bench command exited with status {bench.returncode}")
@@ -120,9 +127,36 @@ def nvidia_smi() -> str:
     return text.strip() or "nvidia-smi produced no output"
 
 
+class _LogTee:
+    """Copies a process's output to a log file and to this process's stdout."""
+
+    def __init__(self, stream: IO[str], log_file: IO[str], prefix: str) -> None:
+        self._stream = stream
+        self._log_file = log_file
+        self._prefix = prefix
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def _pump(self) -> None:
+        for line in self._stream:
+            self._log_file.write(line)
+            try:
+                sys.stdout.write(self._prefix + line)
+                sys.stdout.flush()
+            except Exception:  # a closed terminal must not stop the log file filling
+                pass
+
+    def close(self) -> None:
+        # A grandchild that outlives the process can hold the pipe open, so the
+        # wait is bounded.
+        self._thread.join(timeout=_STOP_GRACE_SECONDS)
+        self._stream.close()
+        self._log_file.close()
+
+
 def start_process(
-    command: str, log_path: Path, cwd: Path
-) -> tuple[subprocess.Popen[str], object]:
+    command: str, log_path: Path, cwd: Path, prefix: str = ""
+) -> tuple[subprocess.Popen[str], _LogTee]:
     log_file = log_path.open("w", buffering=1)
     # A new session makes the command its own process group, so teardown can
     # signal the server and every child it spawned.
@@ -131,16 +165,18 @@ def start_process(
             command,
             shell=True,
             cwd=cwd,
-            stdout=log_file,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
             text=True,
+            errors="replace",
         )
     except Exception:
         log_file.close()
         raise
-    return proc, log_file
+    assert proc.stdout is not None
+    return proc, _LogTee(proc.stdout, log_file, prefix)
 
 
 def stop_process(proc: subprocess.Popen[str], grace: float = _STOP_GRACE_SECONDS) -> None:
