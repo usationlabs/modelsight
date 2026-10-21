@@ -115,3 +115,14 @@ RUN uv pip install 'maturin[patchelf]' \
     && (cd lib/bindings/python && maturin develop --uv) \
     && uv pip install -e lib/gpu_memory_service -e .
 WORKDIR /
+
+# DeepInfer is built in place and never installed: build.sh puts the compiled
+# extension under deepinfer/_so/ inside the source tree, and DeepInfer's own
+# scripts add the repository root to sys.path. Do the same for Dynamo's worker.
+# Last on purpose, so it does not invalidate any of the slow layers above.
+ENV PYTHONPATH=/opt/DeepInfer
+# Fail the build, not a GPU run, if DeepInfer is not importable or has no
+# compiled extension. It imports only what loads without a GPU driver.
+RUN python -c "import glob, os, deepinfer, deep_cluster; \
+so = [p for p in glob.glob(os.path.join(os.path.dirname(deepinfer.__file__), '_so', '*', '*.so')) if os.path.exists(p)]; \
+assert so, 'no compiled DeepInfer extension under deepinfer/_so'; print(len(so), 'extension(s):', so)"
