@@ -61,32 +61,27 @@ Durations accept forms like `90s`, `20m`, `2h` and `1h30m`.
 
 ## Building your own image (Modal)
 
-Use `build` when the engine is not in a ready-made image, for example a CUDA base with an engine built from source. Everything below applies to `target: modal` only.
+When the engine is not in a ready-made image, for example a CUDA base with an engine built from source, point the experiment at a Dockerfile instead of `image`. Everything below applies to `target: modal` only. A full example lives in [`examples/deepinfer/`](examples/deepinfer/).
 
 ```yaml
-image: nvidia/cuda:13.2.1-devel-ubuntu24.04   # the base
-secrets: [HF_TOKEN]                           # local variables forwarded to the container
+dockerfile: Dockerfile          # relative to this file; use this or `image`, not both
+secrets: [HF_TOKEN]             # local variables forwarded to the container
 cache:
-  prefetch: [org/model]                       # downloaded once, on a CPU container
-build:
-  env: {PATH: /opt/venv/bin:/usr/bin:/bin}    # becomes image environment
-  steps:
-    - apt-get update && apt-get install -y git
-    - git:
-        repo: https://github.com/org/engine
-        path: /opt/engine
-        ref: my-branch                        # branch, tag or full SHA; default: main
-    - cd /opt/engine && pip install -e .
+  prefetch: [org/model]         # downloaded once, on a CPU container
+sources:                        # git repos whose ref is resolved to a commit SHA
+  ENGINE:
+    repo: https://github.com/org/engine
+    ref: my-branch              # branch, tag or full SHA; default: main
 report:
-  - git -C /opt/engine rev-parse HEAD         # output goes to env.txt
+  - git -C /opt/engine rev-parse HEAD
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `build.steps` | Shell commands, or a `git` source (public `https://` repo, absolute `path`, optional `ref`). Each step is its own Modal image layer. |
-| `build.env` | Environment variables set in the image before the steps. |
-| `build.gpu` | Attach a GPU to the build steps. Only set it if a step needs one to compile. |
-| `build.secrets` | Local variable names available to the build steps that mention them (`$NAME`). They are not written into the image. |
+| `dockerfile` | Path to a Dockerfile, relative to the experiment file. The build context is its directory. |
+| `build_args` | Plain `ARG` values passed to the Dockerfile. |
+| `sources` | Named public `https://` repos. Each ref is resolved with `git ls-remote` before anything launches and passed as build args `<NAME>_REPO`, `<NAME>_REF` and `<NAME>_SHA`. The Dockerfile declares `ARG ENGINE_REPO` and `ARG ENGINE_SHA` and fetches that commit. |
+| `add_python` | Ask Modal to add this Python version if the image has none on `PATH`. |
 | `cache.prefetch` | Models downloaded to the cache volume by `ms build`, before any GPU is billed. |
 | `cache.volume`, `cache.mount` | Modal volume name (default `modelsight-cache`) and where it is mounted (default `/cache`). `HF_HOME` points inside it. |
 | `secrets` | Names of local environment variables (or `.env` entries) forwarded to the run. Without this field, the named Modal secret `huggingface` is used as before. |
@@ -95,10 +90,10 @@ report:
 ```bash
 uv run ms build -f exp.yaml     # build the image and prefetch models, no GPU
 uv run ms run -f exp.yaml       # reuses the cached image
-uv run ms run -f exp.yaml --dry-run   # shows the steps, resolved SHAs and fingerprint
+uv run ms run -f exp.yaml --dry-run   # shows the Dockerfile, resolved SHAs and fingerprint
 ```
 
-**Caching.** Modal caches each layer by its content, and a changed layer rebuilds everything after it. Put slow, stable steps first and the part you change often last. A git `ref` is resolved to a commit SHA with `git ls-remote` before anything launches and the layer clones that exact commit, so a branch that moved rebuilds only its layer and the ones after it. The resolved SHAs and an image fingerprint are printed and saved in `env.txt`. Modal does not give images names, so "built" means the layers are cached in your workspace.
+**Caching.** Modal caches each layer by its content, and a changed layer rebuilds everything after it. Put slow, stable instructions first and the part you change often last. Because `sources` pass the commit SHA as a build arg, a branch that moved rebuilds only the layers from its `ARG` onward. `ms` appends its own layers (uv and AIPerf, then the cache env) after the Dockerfile's. The resolved SHAs and an image fingerprint are printed and saved in `env.txt`. The fingerprint covers the Dockerfile text, build args and `ms`'s layers, not files copied from the build context. Modal does not give images names, so "built" means the layers are cached in your workspace.
 
 **Secrets.** Only variable names appear in logs and files. `ms` stops before launching if a named variable is unset.
 
