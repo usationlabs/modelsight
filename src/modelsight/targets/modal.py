@@ -2,56 +2,131 @@
 
 The server and the bench run in the same container, so the bench command talks
 to localhost. AIPerf is installed with uv into its own environment, leaving the
-image's SGLang environment alone.
+image's engine environment alone. The image comes from `modelsight.build`:
+the experiment's `build` steps become cached layers on top of the base image.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict
+import os
 from pathlib import Path
 
 import modal
 
+from modelsight.build import (  # noqa: F401  (re-exported for callers of this module)
+    UV_VERSION,
+    BuildError,
+    Prepared,
+    install_commands,
+    prepare,
+)
 from modelsight.config import Experiment
 from modelsight.runner import MODAL_TIMEOUT_BUFFER_SECONDS, RunError
 
 VOLUME_NAME = "modelsight-results"
 RESULTS_MOUNT = "/results"
 HF_SECRET = "huggingface"
-# Pinned so image builds stay reproducible. Bump deliberately.
-UV_VERSION = "0.12.5"
 APP_NAME = "modelsight"
+# Downloading a large checkpoint takes a while; this only caps a hung download.
+PREFETCH_TIMEOUT_SECONDS = 4 * 3600
 
 
-def install_commands() -> list[str]:
-    """Shell commands that put a pinned uv and AIPerf on the image PATH."""
-    installer = f"https://astral.sh/uv/{UV_VERSION}/install.sh"
-    return [
-        "DEBIAN_FRONTEND=noninteractive apt-get update && "
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates",
-        f"curl -LsSf {installer} | env UV_UNMANAGED_INSTALL=/usr/local/bin sh",
-        "uv python install 3.12",
-        "uv venv /opt/aiperf --python 3.12",
-        "uv pip install --python /opt/aiperf/bin/python aiperf",
-        "ln -sf /opt/aiperf/bin/aiperf /usr/local/bin/aiperf",
-    ]
+def _local_secret(names: tuple[str, ...]) -> modal.Secret:
+    """A Modal secret holding the values of local environment variables."""
+    return modal.Secret.from_dict({name: os.environ[name] for name in names})
 
 
-def build_image(image_ref: str) -> modal.Image:
-    image = modal.Image.from_registry(image_ref)
-    for command in install_commands():
-        image = image.run_commands(command)
-    # Mounted at runtime, so changing ms does not rebuild the SGLang image.
+def _runtime_secrets(exp: Experiment) -> list[modal.Secret]:
+    if exp.secrets:
+        return [_local_secret(exp.secrets)]
+    # Without a `secrets` list, keep using the named Modal secret.
+    return [modal.Secret.from_name(HF_SECRET, required_keys=["HF_TOKEN"])]
+
+
+def build_image(exp: Experiment, prepared: Prepared) -> modal.Image:
+    """Map the planned layers onto Modal image calls. Modal caches each layer."""
+    assert exp.image
+    image = modal.Image.from_registry(exp.image)
+    for layer in prepared.layers:
+        if layer.kind == "env":
+            image = image.env(dict(layer.env))
+        else:
+            secrets = [_local_secret(layer.secrets)] if layer.secrets else None
+            image = image.run_commands(layer.command, secrets=secrets, gpu=layer.gpu)
+    # Mounted at runtime, so changing ms does not rebuild the engine image.
     return image.add_local_python_source("modelsight")
 
 
-def run(exp: Experiment, config_text: str, run_name: str) -> Path:
+def _prepared(exp: Experiment, prepared: Prepared | None) -> Prepared:
+    if prepared is not None:
+        return prepared
+    try:
+        return prepare(exp)
+    except BuildError as exc:
+        raise RunError(str(exc)) from exc
+
+
+def build(exp: Experiment, prepared: Prepared | None = None) -> None:
+    """Build the image now, and download `cache.prefetch` models, on CPU.
+
+    Modal caches the layers, so a later `ms run` with the same build section
+    starts without rebuilding. Weights land on the cache volume.
+    """
+    if not exp.image:
+        raise RunError("modal target requires an image")
+    prepared = _prepared(exp, prepared)
+    models = list(exp.cache.prefetch) if exp.cache else []
+    print(f"building image {prepared.fingerprint} on Modal (no GPU)", flush=True)
+
+    cache_volume = (
+        modal.Volume.from_name(exp.cache.volume, create_if_missing=True)
+        if exp.cache
+        else None
+    )
+    volumes = {exp.cache.mount: cache_volume} if exp.cache and cache_volume else {}
+    app = modal.App(APP_NAME)
+
+    @app.function(
+        image=build_image(exp, prepared),
+        timeout=PREFETCH_TIMEOUT_SECONDS,
+        volumes=volumes,
+        secrets=[_local_secret(exp.secrets)] if exp.secrets else [],
+        serialized=True,
+    )
+    def prepare_remote(models: list[str]) -> None:
+        import subprocess
+
+        for model in models:
+            print(f"downloading {model}", flush=True)
+            subprocess.run(
+                ["uvx", "--from", "huggingface_hub", "hf", "download", model],
+                check=True,
+            )
+        if cache_volume is not None:
+            cache_volume.commit()
+
+    try:
+        with modal.enable_output(), app.run():
+            prepare_remote.remote(models)
+    except Exception as exc:
+        raise RunError(f"modal build failed: {exc}") from exc
+    print(f"image {prepared.fingerprint} is built and cached", flush=True)
+
+
+def run(
+    exp: Experiment,
+    config_text: str,
+    run_name: str,
+    prepared: Prepared | None = None,
+) -> Path:
     if not exp.gpu or not exp.image:
         raise RunError("modal target requires gpu and image")
+    prepared = _prepared(exp, prepared)
 
     local_dir = _local_destination(exp.output, run_name)
     print(
-        f"submitting to Modal: gpu={exp.gpu} image={exp.image} volume={VOLUME_NAME}",
+        f"submitting to Modal: gpu={exp.gpu} image={exp.image} "
+        f"fingerprint={prepared.fingerprint} volume={VOLUME_NAME}",
         flush=True,
     )
     print(
@@ -61,37 +136,51 @@ def run(exp: Experiment, config_text: str, run_name: str) -> Path:
     )
 
     volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+    volumes = {RESULTS_MOUNT: volume}
+    cache_volume = None
+    if exp.cache:
+        cache_volume = modal.Volume.from_name(exp.cache.volume, create_if_missing=True)
+        volumes[exp.cache.mount] = cache_volume
     app = modal.App(APP_NAME)
-    image = build_image(exp.image)
+    image = build_image(exp, prepared)
+    info_text = prepared.info_text(exp)
 
     @app.function(
         image=image,
         gpu=exp.gpu,
         timeout=int(exp.timeout_seconds) + MODAL_TIMEOUT_BUFFER_SECONDS,
-        volumes={RESULTS_MOUNT: volume},
-        secrets=[modal.Secret.from_name(HF_SECRET, required_keys=["HF_TOKEN"])],
+        volumes=volumes,
+        secrets=_runtime_secrets(exp),
         serialized=True,
     )
-    def remote(payload: dict, config_text: str, run_name: str) -> None:
+    def remote(mapping: dict, config_text: str, run_name: str, info_text: str) -> None:
         # Imports stay inside the function so the container only needs modelsight
         # and the standard library, not the client's CLI dependencies.
         from pathlib import Path
 
-        from modelsight.config import Experiment
+        from modelsight.config import experiment_from_mapping
         from modelsight.runner import execute_run
 
-        experiment = Experiment(**payload)
+        experiment = experiment_from_mapping(mapping)
         try:
-            execute_run(experiment, Path(RESULTS_MOUNT) / run_name, config_text)
+            execute_run(
+                experiment,
+                Path(RESULTS_MOUNT) / run_name,
+                config_text,
+                extra_env=info_text,
+            )
         finally:
-            try:
-                volume.commit()
-            except Exception as exc:
-                print(f"warning: could not commit results volume: {exc}", flush=True)
+            for mounted in (volume, cache_volume):
+                if mounted is None:
+                    continue
+                try:
+                    mounted.commit()
+                except Exception as exc:
+                    print(f"warning: could not commit a volume: {exc}", flush=True)
 
     try:
         with modal.enable_output(), app.run():
-            remote.remote(asdict(exp), config_text, run_name)
+            remote.remote(exp.to_mapping(), config_text, run_name, info_text)
     except RunError:
         _download(volume, run_name, local_dir)
         raise
