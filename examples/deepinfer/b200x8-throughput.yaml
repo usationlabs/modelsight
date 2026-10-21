@@ -1,0 +1,80 @@
+# DeepInfer behind Dynamo on 8 B200 GPUs: a concurrency sweep for throughput.
+#
+# A heavier AIPerf run that measures tokens per second per GPU at rising
+# concurrency, so the result can be priced at DeepSeek's published rates and
+# put next to the "US$38 per GPU-hour" they report. That figure comes from a
+# production cluster with prefill/decode disaggregation and a KV-cache store,
+# so this is a comparison point, not a replication. Read README.md first.
+#
+# From this directory (needs HF_TOKEN in your environment or .env):
+#   ms build -f b200x8-throughput.yaml     # same image as b200x8-1m.yaml, so it is cached
+#   ms run   -f b200x8-throughput.yaml
+# then, with the run's results folder:
+#   python revenue.py --gpus 8 results/<run>/aiperf
+#
+# Not yet validated on hardware. timeout is guessed and is also the most a failed
+# run can cost: 8 B200s are roughly $50 an hour, so 2h is about $100.
+target: modal
+gpu: B200:8
+dockerfile: Dockerfile
+timeout: 2h
+ready_timeout: 45m
+ready_url: http://localhost:8000/v1/models/deepseek-ai/DeepSeek-V4.1-Flash-1017/ready
+
+secrets: [HF_TOKEN]
+
+sources:
+  DEEPINFER:
+    repo: https://github.com/deepseek-ai/DeepInfer
+    ref: 774ce244b87cc0eb8d4b94ab9f5de2ab22049f01
+  DYNAMO:
+    repo: https://github.com/usationlabs/dynamo
+    ref: feat/deepinfer
+
+cache:
+  prefetch: [deepseek-ai/DeepSeek-V4.1-Flash-1017]
+
+report:
+  - git -C /opt/DeepInfer rev-parse HEAD
+  - git -C /opt/dynamo rev-parse HEAD
+  - pip list 2>/dev/null | grep -i -E '^(torch|deep)'
+
+# A larger batch than the 1M-token experiment: 256 sequences, 64k context.
+server: |
+  bash <<'EOF'
+  export DYN_DISCOVERY_BACKEND=file DYN_FILE_KV=/tmp/dynamo_kv
+  unset NATS_SERVER
+  python -m dynamo.frontend --discovery-backend file &
+  python -m dynamo.deepinfer --discovery-backend file \
+    --model deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+    --expert-parallel-size 8 --context-parallel-size 8 \
+    --max-model-len 65536 --max-num-seqs 256 --max-num-batched-tokens 32768 &
+  wait -n
+  EOF
+
+# One AIPerf run per concurrency, each for a fixed time after a warmup. Edit the
+# first lines to change the workload. AIPerf loads the tokenizer from Hugging
+# Face at the start of each run, so each is retried once on failure.
+bench: |
+  bash <<'EOF'
+  set -e
+  MODEL=deepseek-ai/DeepSeek-V4.1-Flash-1017
+  ISL=8192                       # input tokens per request
+  OSL=1024                       # output tokens per request
+  CONCURRENCIES="16 32 64 128"   # total across all 8 GPUs
+  DURATION=300                   # seconds measured per concurrency
+
+  for C in $CONCURRENCIES; do
+    echo "=== concurrency $C: isl=$ISL osl=$OSL for ${DURATION}s"
+    for attempt in 1 2; do
+      aiperf profile --model $MODEL --url http://localhost:8000 \
+        --endpoint-type chat --streaming \
+        --isl $ISL --osl $OSL --concurrency $C --warmup-request-count $C \
+        --benchmark-duration $DURATION --benchmark-grace-period 120 \
+        --random-seed 1 --ui none --output-artifact-dir "$PWD/aiperf/c$C" && break
+      echo "aiperf failed (attempt $attempt)"
+      [ $attempt = 2 ] && exit 1
+    done
+  done
+  echo "done; price it with: python revenue.py --gpus 8 <results folder>/aiperf"
+  EOF
