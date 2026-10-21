@@ -9,3 +9,5 @@ results/
 .env
 interpretation/
 PLAN.md
+# ms: saved detached runs
+.ms/
