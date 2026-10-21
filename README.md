@@ -59,6 +59,49 @@ Durations accept forms like `90s`, `20m`, `2h` and `1h30m`.
 
 **Request count.** AIPerf sends only 10 requests unless you set `--request-count`. That is fine for a smoke test, but with a concurrency above 10 the configured concurrency is never reached. Set it (a common rule of thumb is about 10x the concurrency) when you want numbers to compare.
 
+## Building your own image (Modal)
+
+Use `build` when the engine is not in a ready-made image, for example a CUDA base with an engine built from source. Everything below applies to `target: modal` only.
+
+```yaml
+image: nvidia/cuda:13.2.1-devel-ubuntu24.04   # the base
+secrets: [HF_TOKEN]                           # local variables forwarded to the container
+cache:
+  prefetch: [org/model]                       # downloaded once, on a CPU container
+build:
+  env: {PATH: /opt/venv/bin:/usr/bin:/bin}    # becomes image environment
+  steps:
+    - apt-get update && apt-get install -y git
+    - git:
+        repo: https://github.com/org/engine
+        path: /opt/engine
+        ref: my-branch                        # branch, tag or full SHA; default: main
+    - cd /opt/engine && pip install -e .
+report:
+  - git -C /opt/engine rev-parse HEAD         # output goes to env.txt
+```
+
+| Field | Meaning |
+| --- | --- |
+| `build.steps` | Shell commands, or a `git` source (public `https://` repo, absolute `path`, optional `ref`). Each step is its own Modal image layer. |
+| `build.env` | Environment variables set in the image before the steps. |
+| `build.gpu` | Attach a GPU to the build steps. Only set it if a step needs one to compile. |
+| `build.secrets` | Local variable names available to the build steps that mention them (`$NAME`). They are not written into the image. |
+| `cache.prefetch` | Models downloaded to the cache volume by `ms build`, before any GPU is billed. |
+| `cache.volume`, `cache.mount` | Modal volume name (default `modelsight-cache`) and where it is mounted (default `/cache`). `HF_HOME` points inside it. |
+| `secrets` | Names of local environment variables (or `.env` entries) forwarded to the run. Without this field, the named Modal secret `huggingface` is used as before. |
+| `report` | Commands run in the container whose output is appended to `env.txt`, for example the revisions under test. |
+
+```bash
+uv run ms build -f exp.yaml     # build the image and prefetch models, no GPU
+uv run ms run -f exp.yaml       # reuses the cached image
+uv run ms run -f exp.yaml --dry-run   # shows the steps, resolved SHAs and fingerprint
+```
+
+**Caching.** Modal caches each layer by its content, and a changed layer rebuilds everything after it. Put slow, stable steps first and the part you change often last. A git `ref` is resolved to a commit SHA with `git ls-remote` before anything launches and the layer clones that exact commit, so a branch that moved rebuilds only its layer and the ones after it. The resolved SHAs and an image fingerprint are printed and saved in `env.txt`. Modal does not give images names, so "built" means the layers are cached in your workspace.
+
+**Secrets.** Only variable names appear in logs and files. `ms` stops before launching if a named variable is unset.
+
 ## What a run does
 
 1. Start the `server` command, locally or inside a Modal container.
