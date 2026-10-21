@@ -54,15 +54,29 @@ RUN pip install -r requirements-nvidia.txt
 # target that DeepInfer's build_vendor.sh passes takes over. The wrapper keeps
 # lspci from failing where /sys/bus/pci is unavailable (sandboxed builders).
 # It sits after the dependency layer so changing it does not redo that layer.
-RUN apt-get update && apt-get install -y --no-install-recommends pciutils \
+#
+# DeepEP and DeepGEMM compile against DeepJIT, whose exception.hpp includes
+# <elfutils/libdwfl.h> (libdw-dev) and loads libdw.so.1 at runtime to print
+# stack traces, so the same package serves the build and the running image.
+RUN apt-get update && apt-get install -y --no-install-recommends pciutils libdw-dev \
     && rm -rf /var/lib/apt/lists/* \
     && printf '#!/bin/sh\n/usr/bin/lspci "$@" 2>/dev/null\nexit 0\n' > /usr/local/bin/lspci \
     && chmod +x /usr/local/bin/lspci
 
 # DeepInfer's build.sh installs the requirements (done above), patches NCCL,
-# builds the vendored kernels, then builds DeepInfer. Those are separate layers
-# here, so a failure in a later one does not repeat the long kernel compiles.
+# builds the vendored kernels with scripts/build_vendor.sh, then builds DeepInfer.
+# They are separate layers here, one per vendored package with the same commands
+# build_vendor.sh runs, so a failure in one does not repeat the others' long
+# compiles.
 RUN pip install --no-deps --force-reinstall nvidia-nccl-cu13==2.32.3
+
+ENV WHEEL_DIR=/opt/vendor-wheels
+RUN mkdir -p "$WHEEL_DIR" \
+    && git config --global url."https://github.com/".insteadOf git@github.com: \
+    && git submodule update --init
+
+RUN cd vendor/DeepSelect && git submodule update --init --recursive \
+    && DEEP_SELECT_BUILD_TARGET_PLATFORM=CUDA python setup.py bdist_wheel --dist-dir "$WHEEL_DIR"
 
 # FlashMLA fails its build if any kernel of its own spills registers. With
 # CUDA 13.2's nvcc, four instantiations of the sm100 sparse decode kernel
@@ -70,7 +84,18 @@ RUN pip install --no-deps --force-reinstall nvidia-nccl-cu13==2.32.3
 # stack frame, 20 bytes of spill stores and 28 of loads. That is a performance
 # guard, not a correctness one, and FlashMLA provides this switch to skip it. It
 # is set only for this step. Compare kernel speed if throughput looks low.
-RUN FLASH_MLA_SKIP_REG_SPILL_CHECK=1 bash ./scripts/build_vendor.sh
+RUN cd vendor/FlashMLA && git submodule update --init --recursive \
+    && FLASH_MLA_BUILD_TARGET_PLATFORM=CUDA FLASH_MLA_SKIP_REG_SPILL_CHECK=1 \
+       python setup.py bdist_wheel --dist-dir "$WHEEL_DIR"
+
+RUN cd vendor/DeepEP && git submodule update --init --recursive \
+    && python setup.py bdist_wheel --dist-dir "$WHEEL_DIR"
+
+RUN cd vendor/DeepGEMM && git submodule update --init --recursive \
+    && DG_FORCE_BUILD=1 python setup.py bdist_wheel --dist-dir "$WHEEL_DIR"
+
+RUN python -m pip install --no-deps --no-index --find-links "$WHEEL_DIR" \
+    deep_select flash_mla deep_ep deep_gemm
 RUN bash ./scripts/build.sh build
 
 # --- Dynamo's Python bindings (Rust) ----------------------------------------
