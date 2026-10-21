@@ -1,0 +1,123 @@
+# DeepInfer behind Dynamo on 8 B200 GPUs, with a ~1M-token prompt.
+#
+# First time, build the image and download the weights (no GPU billed):
+#   ms build -f examples/deepinfer-b200x8-1m.yaml
+# Then run it (needs HF_TOKEN in your environment or .env):
+#   ms run -f examples/deepinfer-b200x8-1m.yaml
+#
+# Everything under `build:` is cached by Modal, so a second run reuses it. The
+# Dynamo layer is last on purpose: when feat/deepinfer moves, only that layer
+# and the ones after it rebuild. To test another branch, change `ref`.
+#
+# Not yet validated on hardware. ready_timeout and timeout are guesses: 8 B200s
+# cost roughly $50 an hour, so timeout is also the most a failed run can cost.
+target: modal
+gpu: B200:8
+image: nvidia/cuda:13.2.1-devel-ubuntu24.04
+timeout: 1h30m
+ready_timeout: 45m
+ready_url: http://localhost:8000/v1/models/deepseek-ai/DeepSeek-V4.1-Flash-1017/ready
+
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [deepseek-ai/DeepSeek-V4.1-Flash-1017]
+
+build:
+  env:
+    VIRTUAL_ENV: /opt/venv
+    PATH: /opt/venv/bin:/root/.cargo/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin
+    DEEPINFER_ACCELERATOR: nvidia
+    # DeepGEMM and DeepEP compile kernels at runtime; keep the cache on the volume.
+    DG_JIT_CACHE_DIR: /cache/dj
+  steps:
+    - >-
+      apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+      build-essential cmake pkg-config protobuf-compiler libprotobuf-dev clang libclang-dev
+      patchelf git curl ca-certificates
+    - uv venv /opt/venv --python 3.12 && uv pip install pip
+    - git:
+        repo: https://github.com/deepseek-ai/DeepInfer
+        path: /opt/DeepInfer
+        ref: 774ce244b87cc0eb8d4b94ab9f5de2ab22049f01
+    - cd /opt/DeepInfer && pip install -r requirements-nvidia.txt
+    - cd /opt/DeepInfer && ./build.sh
+    - curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+    - git:
+        repo: https://github.com/usationlabs/dynamo
+        path: /opt/dynamo
+        ref: feat/deepinfer
+    - >-
+      cd /opt/dynamo && uv pip install 'maturin[patchelf]'
+      && (cd lib/bindings/python && maturin develop --uv)
+      && uv pip install -e lib/gpu_memory_service -e .
+
+report:
+  - git -C /opt/DeepInfer rev-parse HEAD
+  - git -C /opt/dynamo rev-parse HEAD
+  - pip list 2>/dev/null | grep -i -E '^(torch|deep)'
+
+# One host, so Dynamo's file discovery backend replaces etcd and NATS.
+server: |
+  bash <<'EOF'
+  export DYN_DISCOVERY_BACKEND=file DYN_FILE_KV=/tmp/dynamo_kv
+  unset NATS_SERVER
+  python -m dynamo.frontend --discovery-backend file &
+  python -m dynamo.deepinfer --discovery-backend file \
+    --model deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+    --expert-parallel-size 8 --context-parallel-size 8 \
+    --max-model-len 1048576 &
+  wait -n
+  EOF
+
+bench: |
+  bash <<'EOF'
+  set -e
+  MODEL=deepseek-ai/DeepSeek-V4.1-Flash-1017
+  URL=http://localhost:8000/v1/chat/completions
+  JSON='Content-Type: application/json'
+
+  echo "--- chat"
+  curl -s $URL -H "$JSON" -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Name three prime numbers.\"}],\"max_tokens\":64}"
+
+  echo; echo "--- stream, cut off by the client after 3s"
+  curl -sN --max-time 3 $URL -H "$JSON" -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Count to 1000.\"}],\"max_tokens\":4096,\"stream\":true}" || true
+
+  echo; echo "--- still alive after the abort"
+  curl -s $URL -H "$JSON" -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Say OK.\"}],\"max_tokens\":16}"
+
+  echo; echo "--- ~1M token prompt"
+  python - <<'PY'
+  import json, time, urllib.request
+
+  MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+  URL = "http://localhost:8000/v1/chat/completions"
+  TARGET_TOKENS = 1_000_000
+  SENTENCE = "The quick brown fox jumps over the lazy dog near the quiet river bank. "
+
+  def ask(sentences, question, max_tokens=32):
+      body = json.dumps({
+          "model": MODEL,
+          "messages": [{"role": "user", "content": SENTENCE * sentences + question}],
+          "max_tokens": max_tokens,
+      }).encode()
+      request = urllib.request.Request(URL, body, {"Content-Type": "application/json"})
+      start = time.time()
+      with urllib.request.urlopen(request, timeout=3600) as response:
+          result = json.load(response)
+      return result, time.time() - start
+
+  probe, _ = ask(2000, "Reply with one word.", max_tokens=1)
+  per_sentence = probe["usage"]["prompt_tokens"] / 2000
+  sentences = int(TARGET_TOKENS / per_sentence)
+  print(f"probe: {per_sentence:.2f} tokens per sentence, sending {sentences} sentences")
+  result, seconds = ask(sentences, "Reply with one word.")
+  print(json.dumps({"usage": result["usage"], "seconds": round(seconds, 1),
+                    "finish_reason": result["choices"][0]["finish_reason"],
+                    "text": result["choices"][0]["message"]["content"]}))
+  PY
+
+  echo; echo "--- aiperf, light concurrency"
+  aiperf profile --model $MODEL --url http://localhost:8000 --endpoint-type chat \
+    --streaming --concurrency 4 --request-count 16 --ui none
+  EOF
