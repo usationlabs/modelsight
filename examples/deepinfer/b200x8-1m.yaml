@@ -1,56 +1,35 @@
 # DeepInfer behind Dynamo on 8 B200 GPUs, with a ~1M-token prompt.
 #
-# First time, build the image and download the weights (no GPU billed):
-#   ms build -f examples/deepinfer-b200x8-1m.yaml
-# Then run it (needs HF_TOKEN in your environment or .env):
-#   ms run -f examples/deepinfer-b200x8-1m.yaml
+# From this directory (needs HF_TOKEN in your environment or .env):
+#   ms build -f b200x8-1m.yaml    # build the image, download the weights; no GPU billed
+#   ms run   -f b200x8-1m.yaml    # reuses the cached image
 #
-# Everything under `build:` is cached by Modal, so a second run reuses it. The
-# Dynamo layer is last on purpose: when feat/deepinfer moves, only that layer
-# and the ones after it rebuild. To test another branch, change `ref`.
+# The image is the Dockerfile next to this file. Modal caches each of its
+# layers, so a second run starts without rebuilding. `sources` are resolved to
+# commit SHAs and passed to the Dockerfile as <NAME>_REPO/_REF/_SHA build
+# args. To test another Dynamo branch, change DYNAMO's ref.
 #
 # Not yet validated on hardware. ready_timeout and timeout are guesses: 8 B200s
 # cost roughly $50 an hour, so timeout is also the most a failed run can cost.
 target: modal
 gpu: B200:8
-image: nvidia/cuda:13.2.1-devel-ubuntu24.04
+dockerfile: Dockerfile
 timeout: 1h30m
 ready_timeout: 45m
 ready_url: http://localhost:8000/v1/models/deepseek-ai/DeepSeek-V4.1-Flash-1017/ready
 
 secrets: [HF_TOKEN]
 
+sources:
+  DEEPINFER:
+    repo: https://github.com/deepseek-ai/DeepInfer
+    ref: 774ce244b87cc0eb8d4b94ab9f5de2ab22049f01
+  DYNAMO:
+    repo: https://github.com/usationlabs/dynamo
+    ref: feat/deepinfer
+
 cache:
   prefetch: [deepseek-ai/DeepSeek-V4.1-Flash-1017]
-
-build:
-  env:
-    VIRTUAL_ENV: /opt/venv
-    PATH: /opt/venv/bin:/root/.cargo/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin
-    DEEPINFER_ACCELERATOR: nvidia
-    # DeepGEMM and DeepEP compile kernels at runtime; keep the cache on the volume.
-    DG_JIT_CACHE_DIR: /cache/dj
-  steps:
-    - >-
-      apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
-      build-essential cmake pkg-config protobuf-compiler libprotobuf-dev clang libclang-dev
-      patchelf git curl ca-certificates
-    - uv venv /opt/venv --python 3.12 && uv pip install pip
-    - git:
-        repo: https://github.com/deepseek-ai/DeepInfer
-        path: /opt/DeepInfer
-        ref: 774ce244b87cc0eb8d4b94ab9f5de2ab22049f01
-    - cd /opt/DeepInfer && pip install -r requirements-nvidia.txt
-    - cd /opt/DeepInfer && ./build.sh
-    - curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
-    - git:
-        repo: https://github.com/usationlabs/dynamo
-        path: /opt/dynamo
-        ref: feat/deepinfer
-    - >-
-      cd /opt/dynamo && uv pip install 'maturin[patchelf]'
-      && (cd lib/bindings/python && maturin develop --uv)
-      && uv pip install -e lib/gpu_memory_service -e .
 
 report:
   - git -C /opt/DeepInfer rev-parse HEAD
