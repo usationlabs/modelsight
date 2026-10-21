@@ -20,6 +20,10 @@ class FakeSecret:
     def from_dict(cls, values: dict[str, str]) -> "FakeSecret":
         return cls(values)
 
+    @classmethod
+    def from_name(cls, name: str, required_keys=None) -> "FakeSecret":
+        return cls({})
+
 
 class FakeImage:
     def __init__(self, calls: list) -> None:
@@ -106,3 +110,106 @@ def test_runtime_secrets_come_from_local_environment(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("HF_TOKEN", "hf_value")
     [secret] = target._runtime_secrets(_experiment(secrets=("HF_TOKEN",)))
     assert secret.values == {"HF_TOKEN": "hf_value"}
+
+
+class FakeVolume:
+    @classmethod
+    def from_name(cls, name: str, create_if_missing: bool = False) -> "FakeVolume":
+        return cls()
+
+    def commit(self) -> None:
+        pass
+
+    def reload(self) -> None:
+        pass
+
+    def listdir(self, *args, **kwargs):
+        return []
+
+
+class FakeFunction:
+    def __init__(self, fn) -> None:
+        self.fn = fn
+
+    def remote(self, *args, **kwargs) -> None:
+        return None
+
+
+class FakeApp:
+    """Records how the app was run; function() hands back something callable."""
+
+    runs: list[dict] = []
+    app_id = "ap-fake"
+
+    def __init__(self, name: str) -> None:
+        pass
+
+    def function(self, **kwargs):
+        return FakeFunction
+
+    def run(self, **kwargs):
+        FakeApp.runs.append(kwargs)
+        return _NullContext()
+
+
+class _NullContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+
+@pytest.fixture
+def fake_app(monkeypatch: pytest.MonkeyPatch):
+    FakeApp.runs = []
+    monkeypatch.setattr(
+        target,
+        "modal",
+        SimpleNamespace(
+            Image=FakeImage,
+            Secret=FakeSecret,
+            Volume=FakeVolume,
+            App=FakeApp,
+            enable_output=lambda: _NullContext(),
+        ),
+    )
+    return FakeApp
+
+
+def test_build_is_detached_by_default_so_a_network_blip_cannot_cancel_a_download(
+    fake_app, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exp = _experiment(cache=Cache(prefetch=("org/model",)))
+    target.build(exp, prepare(exp))
+    assert fake_app.runs == [{"detach": True}]
+    assert "modal app stop ap-fake" in capsys.readouterr().out
+
+
+def test_build_can_be_attached(fake_app) -> None:
+    exp = _experiment(cache=Cache(prefetch=("org/model",)))
+    target.build(exp, prepare(exp), detach=False)
+    assert fake_app.runs == [{"detach": False}]
+
+
+def test_run_is_attached_by_default_and_says_what_a_disconnect_does(
+    fake_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exp = _experiment(output=str(tmp_path))
+    monkeypatch.setattr(target, "_download", lambda *a, **k: True)
+    target.run(exp, "yaml", "name", prepare(exp))
+    assert fake_app.runs == [{"detach": False}]
+    out = capsys.readouterr().out
+    assert "not detached" in out and "--detach" in out
+    assert "even if this laptop disconnects" not in out
+
+
+def test_run_can_be_detached(
+    fake_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exp = _experiment(output=str(tmp_path))
+    monkeypatch.setattr(target, "_download", lambda *a, **k: True)
+    target.run(exp, "yaml", "name", prepare(exp), detach=True)
+    assert fake_app.runs == [{"detach": True}]
+    out = capsys.readouterr().out
+    assert "running detached" in out and "modal app stop ap-fake" in out

@@ -72,6 +72,14 @@ def run(
         "--dry-run",
         help="Print what would run, without launching anything.",
     ),
+    detach: bool = typer.Option(
+        False,
+        "--detach",
+        help=(
+            "Modal only: keep the run going if this machine loses its connection. "
+            "Ctrl-C then no longer stops it; use `modal app stop`."
+        ),
+    ),
 ) -> None:
     """Start the server, wait until it responds, run the bench, save results, stop."""
     try:
@@ -80,6 +88,9 @@ def run(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1) from exc
 
+    if detach and experiment.target != "modal":
+        typer.echo("error: --detach only applies to target: modal", err=True)
+        raise typer.Exit(1)
     name = run_name_for(config)
     prepared = _prepare(experiment)
     if dry_run:
@@ -96,7 +107,7 @@ def run(
         if prepared is None:
             run_dir = local.run(experiment, config_text, name)
         else:
-            run_dir = modal.run(experiment, config_text, name, prepared)
+            run_dir = modal.run(experiment, config_text, name, prepared, detach=detach)
     except RunError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1) from exc
@@ -196,6 +207,14 @@ def build(
         "--dry-run",
         help="Print the image plan and resolved refs, without building anything.",
     ),
+    detach: bool = typer.Option(
+        True,
+        "--detach/--no-detach",
+        help=(
+            "Keep building and downloading if this machine loses its connection "
+            "(default). Ctrl-C then does not stop it; use `modal app stop`."
+        ),
+    ),
 ) -> None:
     """Build the Modal image and download cache.prefetch models, without a GPU."""
     try:
@@ -219,7 +238,7 @@ def build(
         return
     _require_env(experiment, prepared)
     try:
-        modal.build(experiment, prepared)
+        modal.build(experiment, prepared, detach=detach)
     except RunError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1) from exc

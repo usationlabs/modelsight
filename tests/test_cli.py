@@ -184,8 +184,9 @@ def test_run_passes_the_prepared_image_to_modal(
     monkeypatch.setenv("HF_TOKEN", "x")
     seen = {}
 
-    def fake_run(exp, text, name, prepared):
+    def fake_run(exp, text, name, prepared, detach=False):
         seen["prepared"] = prepared
+        seen["detach"] = detach
         return tmp_path / "results"
 
     monkeypatch.setattr("modelsight.cli.modal.run", fake_run)
@@ -211,7 +212,10 @@ def test_build_calls_modal_build(
 ) -> None:
     monkeypatch.setenv("HF_TOKEN", "x")
     built = []
-    monkeypatch.setattr("modelsight.cli.modal.build", lambda exp, prepared: built.append(prepared))
+    monkeypatch.setattr(
+        "modelsight.cli.modal.build",
+        lambda exp, prepared, detach=True: built.append((prepared, detach)),
+    )
     config = _deepinfer_config(tmp_path)
     result = runner.invoke(app, ["build", "-f", str(config)])
     assert result.exit_code == 0, result.stdout
@@ -230,3 +234,42 @@ def test_build_rejects_local_target_and_empty_plans(tmp_path: Path) -> None:
     result = runner.invoke(app, ["build", "-f", str(plain)])
     assert result.exit_code == 1
     assert "nothing to build" in result.stderr
+
+
+def test_run_is_not_detached_unless_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "x")
+    seen = []
+    monkeypatch.setattr(
+        "modelsight.cli.modal.run",
+        lambda exp, text, name, prepared, detach=False: seen.append(detach)
+        or tmp_path / "results",
+    )
+    config = _deepinfer_config(tmp_path)
+    assert runner.invoke(app, ["run", "-f", str(config)]).exit_code == 0
+    assert runner.invoke(app, ["run", "-f", str(config), "--detach"]).exit_code == 0
+    assert seen == [False, True]
+
+
+def test_build_is_detached_unless_told_not_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "x")
+    seen = []
+    monkeypatch.setattr(
+        "modelsight.cli.modal.build",
+        lambda exp, prepared, detach=True: seen.append(detach),
+    )
+    config = _deepinfer_config(tmp_path)
+    assert runner.invoke(app, ["build", "-f", str(config)]).exit_code == 0
+    assert runner.invoke(app, ["build", "-f", str(config), "--no-detach"]).exit_code == 0
+    assert seen == [True, False]
+
+
+def test_detach_is_rejected_for_local_runs(tmp_path: Path) -> None:
+    config = tmp_path / "local.yaml"
+    config.write_text("target: local\nserver: s\nbench: b\n")
+    result = runner.invoke(app, ["run", "-f", str(config), "--detach"])
+    assert result.exit_code == 1
+    assert "target: modal" in result.stderr

@@ -69,11 +69,17 @@ def _prepared(exp: Experiment, prepared: Prepared | None) -> Prepared:
         raise RunError(str(exc)) from exc
 
 
-def build(exp: Experiment, prepared: Prepared | None = None) -> None:
+def build(
+    exp: Experiment, prepared: Prepared | None = None, detach: bool = True
+) -> None:
     """Build the image now, and download `cache.prefetch` models, on CPU.
 
     Modal caches the layers, so a later `ms run` with the same build section
     starts without rebuilding. Weights land on the cache volume.
+
+    Detached by default: Modal stops an app whose client has disconnected, and a
+    brief network failure on this machine would otherwise cancel a download that
+    takes a long time. This function only uses CPUs and has its own timeout.
     """
     prepared = _prepared(exp, prepared)
     models = list(exp.cache.prefetch) if exp.cache else []
@@ -107,7 +113,13 @@ def build(exp: Experiment, prepared: Prepared | None = None) -> None:
             cache_volume.commit()
 
     try:
-        with modal.enable_output(), app.run():
+        with modal.enable_output(), app.run(detach=detach):
+            if detach:
+                print(
+                    "running detached: it keeps going if this machine loses its "
+                    f"connection. Stop it with: modal app stop {app.app_id}",
+                    flush=True,
+                )
             prepare_remote.remote(models)
     except Exception as exc:
         raise RunError(f"modal build failed: {exc}") from exc
@@ -119,6 +131,7 @@ def run(
     config_text: str,
     run_name: str,
     prepared: Prepared | None = None,
+    detach: bool = False,
 ) -> Path:
     if not exp.gpu or not (exp.image or exp.dockerfile):
         raise RunError("modal target requires gpu and an image or dockerfile")
@@ -130,11 +143,20 @@ def run(
         f"fingerprint={prepared.fingerprint} volume={VOLUME_NAME}",
         flush=True,
     )
-    print(
-        "results are stored on the volume even if this laptop disconnects; "
-        f"retrieve them with: modal volume get {VOLUME_NAME} {run_name} {local_dir}",
-        flush=True,
-    )
+    if detach:
+        print(
+            "running detached: the container keeps going if this machine loses its "
+            "connection to Modal, and still stops at timeout. Results are stored on "
+            f"the volume; retrieve them with: modal volume get {VOLUME_NAME} {run_name} {local_dir}",
+            flush=True,
+        )
+    else:
+        print(
+            "not detached: if this machine loses its connection to Modal for more than "
+            "a minute or so, Modal stops the app and the run is lost. Use --detach to "
+            "let it finish regardless.",
+            flush=True,
+        )
 
     volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
     volumes = {RESULTS_MOUNT: volume}
@@ -180,7 +202,9 @@ def run(
                     print(f"warning: could not commit a volume: {exc}", flush=True)
 
     try:
-        with modal.enable_output(), app.run():
+        with modal.enable_output(), app.run(detach=detach):
+            if detach:
+                print(f"stop it with: modal app stop {app.app_id}", flush=True)
             remote.remote(exp.to_mapping(), config_text, run_name, info_text)
     except RunError:
         _download(volume, run_name, local_dir)
