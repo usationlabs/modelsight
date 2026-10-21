@@ -1,16 +1,13 @@
 # DeepInfer behind Dynamo on 8 B200 GPUs: a concurrency sweep for throughput.
 #
-# A heavier AIPerf run that measures tokens per second per GPU at rising
-# concurrency (one AIPerf sweep), so the result can be priced at DeepSeek's published rates and
-# put next to the "US$38 per GPU-hour" they report. That figure comes from a
-# production cluster with prefill/decode disaggregation and a KV-cache store,
-# so this is a comparison point, not a replication. Read README.md first.
+# A heavier AIPerf run: one AIPerf sweep that measures tokens per second at rising
+# concurrency, on the same image as b200x8-1m.yaml (so it is already cached).
+# DeepSeek's own decode-only chart is a rough point of comparison; see README.md.
 #
 # From this directory (needs HF_TOKEN in your environment or .env):
-#   ms build -f b200x8-throughput.yaml     # same image as b200x8-1m.yaml, so it is cached
+#   ms build -f b200x8-throughput.yaml
 #   ms run   -f b200x8-throughput.yaml
-# then, with the run's results folder:
-#   python revenue.py --gpus 8 results/<run>/aiperf
+# AIPerf's results land in <results folder>/aiperf/, one concurrency_N folder per level.
 #
 # Not yet validated on hardware. timeout is guessed and is also the most a failed
 # run can cost: 8 B200s are roughly $50 an hour, so 2h is about $100.
@@ -74,5 +71,5 @@ bench: |
   }
 
   sweep || { echo "aiperf failed, retrying once"; sweep; }
-  echo "done; price it with: python revenue.py --gpus 8 <results folder>/aiperf"
+  echo "done; results are in aiperf/, one concurrency_N folder per level"
   EOF
