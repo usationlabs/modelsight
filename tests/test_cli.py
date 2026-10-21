@@ -144,6 +144,7 @@ def test_dry_run_flags_missing_secrets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
 ) -> None:
     monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.chdir(tmp_path)  # ms reads ./.env, and a real one could set HF_TOKEN
     config = _deepinfer_config(tmp_path)
     result = runner.invoke(app, ["run", "-f", str(config), "--dry-run"])
     assert result.exit_code == 0
@@ -167,6 +168,7 @@ def test_run_refuses_to_start_without_required_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
 ) -> None:
     monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.chdir(tmp_path)  # ms reads ./.env, and a real one could set HF_TOKEN
     launched = []
     monkeypatch.setattr("modelsight.cli.modal.run", lambda *a, **k: launched.append(a))
     config = _deepinfer_config(tmp_path)
