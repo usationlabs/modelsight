@@ -58,7 +58,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends pciutils \
     && rm -rf /var/lib/apt/lists/* \
     && printf '#!/bin/sh\n/usr/bin/lspci "$@" 2>/dev/null\nexit 0\n' > /usr/local/bin/lspci \
     && chmod +x /usr/local/bin/lspci
-RUN ./build.sh
+
+# DeepInfer's build.sh installs the requirements (done above), patches NCCL,
+# builds the vendored kernels, then builds DeepInfer. Those are separate layers
+# here, so a failure in a later one does not repeat the long kernel compiles.
+RUN pip install --no-deps --force-reinstall nvidia-nccl-cu13==2.32.3
+
+# FlashMLA fails its build if any kernel of its own spills registers. With
+# CUDA 13.2's nvcc, four instantiations of the sm100 sparse decode kernel
+# (flash_fwd_splitkv_mla_fp8_sparse_kernel, head64) spill a few bytes: a 16-byte
+# stack frame, 20 bytes of spill stores and 28 of loads. That is a performance
+# guard, not a correctness one, and FlashMLA provides this switch to skip it. It
+# is set only for this step. Compare kernel speed if throughput looks low.
+RUN FLASH_MLA_SKIP_REG_SPILL_CHECK=1 bash ./scripts/build_vendor.sh
+RUN bash ./scripts/build.sh build
 
 # --- Dynamo's Python bindings (Rust) ----------------------------------------
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
