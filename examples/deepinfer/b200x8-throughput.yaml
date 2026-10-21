@@ -1,7 +1,7 @@
 # DeepInfer behind Dynamo on 8 B200 GPUs: a concurrency sweep for throughput.
 #
 # A heavier AIPerf run that measures tokens per second per GPU at rising
-# concurrency, so the result can be priced at DeepSeek's published rates and
+# concurrency (one AIPerf sweep), so the result can be priced at DeepSeek's published rates and
 # put next to the "US$38 per GPU-hour" they report. That figure comes from a
 # production cluster with prefill/decode disaggregation and a KV-cache store,
 # so this is a comparison point, not a replication. Read README.md first.
@@ -52,29 +52,27 @@ server: |
   wait -n
   EOF
 
-# One AIPerf run per concurrency, each for a fixed time after a warmup. Edit the
-# first lines to change the workload. AIPerf loads the tokenizer from Hugging
-# Face at the start of each run, so each is retried once on failure.
+# One AIPerf sweep: a measurement for each concurrency in the list, each for a
+# fixed time after a warmup. Edit the variables at the top to change the load.
+# AIPerf loads the tokenizer from Hugging Face when it starts, so the sweep is
+# retried once if it fails.
 bench: |
   bash <<'EOF'
-  set -e
   MODEL=deepseek-ai/DeepSeek-V4.1-Flash-1017
-  ISL=8192                       # input tokens per request
-  OSL=1024                       # output tokens per request
-  CONCURRENCIES="16 32 64 128"   # total across all 8 GPUs
-  DURATION=300                   # seconds measured per concurrency
+  ISL=8192                      # input tokens per request
+  OSL=1024                      # output tokens per request
+  CONCURRENCIES=16,32,64,128    # requests in flight, total across all 8 GPUs
+  DURATION=300                  # seconds measured at each concurrency
 
-  for C in $CONCURRENCIES; do
-    echo "=== concurrency $C: isl=$ISL osl=$OSL for ${DURATION}s"
-    for attempt in 1 2; do
-      aiperf profile --model $MODEL --url http://localhost:8000 \
-        --endpoint-type chat --streaming \
-        --isl $ISL --osl $OSL --concurrency $C --warmup-request-count $C \
-        --benchmark-duration $DURATION --benchmark-grace-period 120 \
-        --random-seed 1 --ui none --output-artifact-dir "$PWD/aiperf/c$C" && break
-      echo "aiperf failed (attempt $attempt)"
-      [ $attempt = 2 ] && exit 1
-    done
-  done
+  sweep() {
+    aiperf profile --model $MODEL --url http://localhost:8000 \
+      --endpoint-type chat --streaming \
+      --isl $ISL --osl $OSL --concurrency $CONCURRENCIES \
+      --warmup-request-count 64 \
+      --benchmark-duration $DURATION --benchmark-grace-period 120 \
+      --random-seed 1 --ui none --output-artifact-dir "$PWD/aiperf"
+  }
+
+  sweep || { echo "aiperf failed, retrying once"; sweep; }
   echo "done; price it with: python revenue.py --gpus 8 <results folder>/aiperf"
   EOF
