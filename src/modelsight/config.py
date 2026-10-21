@@ -7,7 +7,7 @@ strings, copied through as the user wrote them.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,15 +30,18 @@ _KNOWN_FIELDS = {
     "ready_timeout",
     "timeout",
     "output",
-    "build",
+    "dockerfile",
+    "build_args",
+    "sources",
+    "add_python",
     "cache",
     "secrets",
     "report",
 }
-_BUILD_FIELDS = {"steps", "env", "gpu", "secrets"}
 _CACHE_FIELDS = {"prefetch", "volume", "mount"}
-_GIT_FIELDS = {"repo", "path", "ref"}
+_SOURCE_FIELDS = {"repo", "ref"}
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SOURCE_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _DURATION = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
 
 
@@ -47,22 +50,16 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
-class GitSource:
-    """A repository checked out into the image at the commit `ref` points to."""
+class Source:
+    """A git repository whose ref is resolved to a commit SHA before the build.
 
+    The Dockerfile receives build args `<NAME>_REPO`, `<NAME>_REF` and
+    `<NAME>_SHA`, so a branch that moved changes the layer that uses it.
+    """
+
+    name: str
     repo: str
-    path: str
     ref: str = DEFAULT_GIT_REF
-
-
-@dataclass(frozen=True)
-class Build:
-    """Extra image layers, built once and cached by Modal. Modal only."""
-
-    steps: tuple[str | GitSource, ...]
-    env: tuple[tuple[str, str], ...] = ()
-    gpu: str | None = None
-    secrets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -85,7 +82,12 @@ class Experiment:
     ready_timeout: str
     timeout: str
     output: str
-    build: Build | None = None
+    # A Dockerfile (absolute once loaded) builds the Modal image instead of `image`.
+    dockerfile: str | None = None
+    build_args: tuple[tuple[str, str], ...] = ()
+    sources: tuple[Source, ...] = ()
+    # Modal adds this Python when the image has none on PATH.
+    add_python: str | None = None
     cache: Cache | None = None
     # Names of local environment variables forwarded to the container.
     secrets: tuple[str, ...] = ()
@@ -129,22 +131,17 @@ class Experiment:
                 "volume": self.cache.volume,
                 "mount": self.cache.mount,
             }
-        if self.build:
-            build: dict[str, Any] = {
-                "steps": [
-                    step
-                    if isinstance(step, str)
-                    else {"git": {"repo": step.repo, "path": step.path, "ref": step.ref}}
-                    for step in self.build.steps
-                ],
+        if self.dockerfile:
+            data["dockerfile"] = self.dockerfile
+        if self.build_args:
+            data["build_args"] = dict(self.build_args)
+        if self.sources:
+            data["sources"] = {
+                source.name: {"repo": source.repo, "ref": source.ref}
+                for source in self.sources
             }
-            if self.build.env:
-                build["env"] = dict(self.build.env)
-            if self.build.gpu:
-                build["gpu"] = self.build.gpu
-            if self.build.secrets:
-                build["secrets"] = list(self.build.secrets)
-            data["build"] = build
+        if self.add_python:
+            data["add_python"] = self.add_python
         return data
 
 
@@ -180,7 +177,15 @@ def load_experiment(path: Path) -> tuple[Experiment, str]:
         raise ConfigError(f"invalid YAML in {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"{path} must contain a mapping of experiment fields")
-    return experiment_from_mapping(data), text
+    experiment = experiment_from_mapping(data)
+    if experiment.dockerfile:
+        dockerfile = Path(experiment.dockerfile)
+        if not dockerfile.is_absolute():
+            dockerfile = (path.parent / dockerfile).resolve()
+        if not dockerfile.is_file():
+            raise ConfigError(f"dockerfile {experiment.dockerfile!r} not found at {dockerfile}")
+        experiment = replace(experiment, dockerfile=str(dockerfile))
+    return experiment, text
 
 
 def experiment_from_mapping(data: dict) -> Experiment:
@@ -194,19 +199,42 @@ def experiment_from_mapping(data: dict) -> Experiment:
 
     gpu = _optional_string(data, "gpu")
     image = _optional_string(data, "image")
+    dockerfile = _optional_string(data, "dockerfile")
     if target == "modal":
         if not gpu:
             raise ConfigError("gpu is required when target is modal, for example B200")
-        if not image:
-            raise ConfigError("image is required when target is modal")
+        if image and dockerfile:
+            raise ConfigError("set image or dockerfile, not both")
+        if not image and not dockerfile:
+            raise ConfigError("image or dockerfile is required when target is modal")
 
-    build = _parse_build(data.get("build"))
+    build_args = _parse_build_args(data.get("build_args"))
+    sources = _parse_sources(data.get("sources"))
+    add_python = _optional_string(data, "add_python")
     cache = _parse_cache(data.get("cache"))
     secrets = _env_names(data.get("secrets"), "secrets")
     if target == "local":
-        for name, value in (("build", build), ("cache", cache), ("secrets", secrets)):
+        for name, value in (
+            ("dockerfile", dockerfile),
+            ("build_args", build_args),
+            ("sources", sources),
+            ("add_python", add_python),
+            ("cache", cache),
+            ("secrets", secrets),
+        ):
             if value:
                 raise ConfigError(f"{name} is only supported when target is modal")
+    clashes = {
+        f"{source.name}_{suffix}"
+        for source in sources
+        for suffix in ("REPO", "REF", "SHA")
+    } & {name for name, _ in build_args}
+    if clashes:
+        raise ConfigError(
+            f"build_args {sorted(clashes)[0]!r} is set by sources; remove it from build_args"
+        )
+    if sources and not dockerfile:
+        raise ConfigError("sources are passed to a Dockerfile, so dockerfile is required")
 
     ready_url = _optional_string(data, "ready_url") or DEFAULT_READY_URL
     if not ready_url.startswith(("http://", "https://")):
@@ -226,7 +254,10 @@ def experiment_from_mapping(data: dict) -> Experiment:
         ready_timeout=ready_timeout,
         timeout=timeout,
         output=_optional_string(data, "output") or DEFAULT_OUTPUT,
-        build=build,
+        dockerfile=dockerfile,
+        build_args=build_args,
+        sources=sources,
+        add_python=add_python,
         cache=cache,
         secrets=secrets,
         report=_string_list(data.get("report"), "report"),
@@ -282,54 +313,40 @@ def _mapping(value: Any, field: str, allowed: set[str]) -> dict[str, Any]:
     return value
 
 
-def _parse_build(value: Any) -> Build | None:
+def _parse_build_args(value: Any) -> tuple[tuple[str, str], ...]:
     if value is None:
-        return None
-    data = _mapping(value, "build", _BUILD_FIELDS)
-    raw_steps = data.get("steps")
-    if not isinstance(raw_steps, list) or not raw_steps:
-        raise ConfigError("build.steps is required and must be a non-empty list")
-    steps: list[str | GitSource] = []
-    for index, step in enumerate(raw_steps):
-        steps.append(_parse_step(step, f"build.steps[{index}]"))
-
-    env: list[tuple[str, str]] = []
-    raw_env = data.get("env")
-    if raw_env is not None:
-        if not isinstance(raw_env, dict):
-            raise ConfigError("build.env must be a mapping of names to strings")
-        for name, item in raw_env.items():
-            if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
-                raise ConfigError(f"build.env name {name!r} is not a valid variable name")
-            if not isinstance(item, (str, int, float)) or isinstance(item, bool):
-                raise ConfigError(f"build.env.{name} must be a string")
-            env.append((name, str(item)))
-
-    return Build(
-        steps=tuple(steps),
-        env=tuple(env),
-        gpu=_optional_string(data, "gpu"),
-        secrets=_env_names(data.get("secrets"), "build.secrets"),
-    )
+        return ()
+    if not isinstance(value, dict):
+        raise ConfigError("build_args must be a mapping of names to strings")
+    args = []
+    for name, item in value.items():
+        if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
+            raise ConfigError(f"build_args name {name!r} is not a valid variable name")
+        if not isinstance(item, (str, int, float)) or isinstance(item, bool):
+            raise ConfigError(f"build_args.{name} must be a string")
+        args.append((name, str(item)))
+    return tuple(args)
 
 
-def _parse_step(step: Any, field: str) -> str | GitSource:
-    if isinstance(step, str):
-        if not step.strip():
-            raise ConfigError(f"{field} must not be empty")
-        return step.strip()
-    if isinstance(step, dict) and set(step) == {"git"}:
-        git = _mapping(step["git"], f"{field}.git", _GIT_FIELDS)
-        repo = _require_string(git, "repo")
-        path = _require_string(git, "path")
+def _parse_sources(value: Any) -> tuple[Source, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise ConfigError("sources must be a mapping of names to {repo, ref}")
+    sources = []
+    for name, item in value.items():
+        if not isinstance(name, str) or not _SOURCE_NAME.fullmatch(name):
+            raise ConfigError(
+                f"sources name {name!r} must be upper case letters, digits and underscores"
+            )
+        data = _mapping(item, f"sources.{name}", _SOURCE_FIELDS)
+        repo = _require_string(data, "repo")
         if not repo.startswith("https://"):
-            raise ConfigError(f"{field}.git.repo must be an https:// URL")
-        if not path.startswith("/"):
-            raise ConfigError(f"{field}.git.path must be an absolute path")
-        return GitSource(
-            repo=repo, path=path, ref=_optional_string(git, "ref") or DEFAULT_GIT_REF
+            raise ConfigError(f"sources.{name}.repo must be an https:// URL")
+        sources.append(
+            Source(name, repo, _optional_string(data, "ref") or DEFAULT_GIT_REF)
         )
-    raise ConfigError(f"{field} must be a shell command or a mapping with a 'git' key")
+    return tuple(sources)
 
 
 def _parse_cache(value: Any) -> Cache | None:

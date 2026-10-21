@@ -10,7 +10,7 @@ import typer
 
 from modelsight import __version__
 from modelsight import build as image_plan
-from modelsight.build import BuildError, Prepared, ResolvedGit
+from modelsight.build import BuildError, Prepared
 from modelsight.config import ConfigError, Experiment, load_experiment
 from modelsight.runner import RunError, aiperf_status
 from modelsight.targets import local, modal
@@ -120,7 +120,7 @@ def _prepare(exp: Experiment) -> Prepared | None:
 def _require_env(exp: Experiment, prepared: Prepared | None) -> None:
     if prepared is None:
         return
-    missing = image_plan.missing_env(exp, prepared)
+    missing = image_plan.missing_env(exp)
     if missing:
         typer.echo(
             "error: these environment variables are needed but not set "
@@ -157,23 +157,19 @@ def dry_run_report(
 
 def _image_lines(exp: Experiment, prepared: Prepared) -> list[str]:
     lines = [f"image_fingerprint: {prepared.fingerprint}"]
-    if exp.build:
-        lines.append(f"build: {len(prepared.steps)} steps")
-        for number, step in enumerate(prepared.steps, start=1):
-            if isinstance(step, ResolvedGit):
-                lines.append(
-                    f"  {number}. git {step.repo} {step.ref} -> {step.sha} at {step.path}"
-                )
-            else:
-                first = step.strip().splitlines()[0]
-                lines.append(f"  {number}. {first[:100]}{'...' if len(first) > 100 else ''}")
+    if exp.dockerfile:
+        lines.append(f"dockerfile: {exp.dockerfile}")
+    for source in prepared.sources:
+        lines.append(f"source {source.name}: {source.repo} {source.ref} -> {source.sha}")
+    for name, value in exp.build_args:
+        lines.append(f"build_arg: {name}={value}")
     if exp.cache:
         models = ", ".join(exp.cache.prefetch) or "-"
         lines.append(
             f"cache: volume={exp.cache.volume} mount={exp.cache.mount} prefetch={models}"
         )
     if exp.secrets:
-        missing = set(image_plan.missing_env(exp, prepared))
+        missing = set(image_plan.missing_env(exp))
         shown = ", ".join(
             f"{name} ({'missing' if name in missing else 'set'})" for name in exp.secrets
         )
@@ -210,9 +206,9 @@ def build(
     if experiment.target != "modal":
         typer.echo("error: ms build only applies to target: modal", err=True)
         raise typer.Exit(1)
-    if not experiment.build and not (experiment.cache and experiment.cache.prefetch):
+    if not experiment.dockerfile and not (experiment.cache and experiment.cache.prefetch):
         typer.echo(
-            "error: nothing to build; add a build section or cache.prefetch", err=True
+            "error: nothing to build; add a dockerfile or cache.prefetch", err=True
         )
         raise typer.Exit(1)
 

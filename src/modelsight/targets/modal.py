@@ -3,7 +3,7 @@
 The server and the bench run in the same container, so the bench command talks
 to localhost. AIPerf is installed with uv into its own environment, leaving the
 image's engine environment alone. The image comes from `modelsight.build`:
-the experiment's `build` steps become cached layers on top of the base image.
+a Dockerfile (or registry image) is the base, and ms adds its own layers on top.
 """
 
 from __future__ import annotations
@@ -13,13 +13,7 @@ from pathlib import Path
 
 import modal
 
-from modelsight.build import (  # noqa: F401  (re-exported for callers of this module)
-    UV_VERSION,
-    BuildError,
-    Prepared,
-    install_commands,
-    prepare,
-)
+from modelsight.build import BuildError, Prepared, prepare
 from modelsight.config import Experiment
 from modelsight.runner import MODAL_TIMEOUT_BUFFER_SECONDS, RunError
 
@@ -44,15 +38,24 @@ def _runtime_secrets(exp: Experiment) -> list[modal.Secret]:
 
 
 def build_image(exp: Experiment, prepared: Prepared) -> modal.Image:
-    """Map the planned layers onto Modal image calls. Modal caches each layer."""
-    assert exp.image
-    image = modal.Image.from_registry(exp.image)
+    """The base (registry image or Dockerfile), then the layers ms adds. Modal
+    caches each layer."""
+    if exp.dockerfile:
+        dockerfile = Path(exp.dockerfile)
+        image = modal.Image.from_dockerfile(
+            dockerfile,
+            context_dir=dockerfile.parent,
+            build_args=dict(prepared.build_args),
+            add_python=exp.add_python,
+        )
+    else:
+        assert exp.image
+        image = modal.Image.from_registry(exp.image, add_python=exp.add_python)
     for layer in prepared.layers:
         if layer.kind == "env":
             image = image.env(dict(layer.env))
         else:
-            secrets = [_local_secret(layer.secrets)] if layer.secrets else None
-            image = image.run_commands(layer.command, secrets=secrets, gpu=layer.gpu)
+            image = image.run_commands(layer.command)
     # Mounted at runtime, so changing ms does not rebuild the engine image.
     return image.add_local_python_source("modelsight")
 
@@ -72,8 +75,6 @@ def build(exp: Experiment, prepared: Prepared | None = None) -> None:
     Modal caches the layers, so a later `ms run` with the same build section
     starts without rebuilding. Weights land on the cache volume.
     """
-    if not exp.image:
-        raise RunError("modal target requires an image")
     prepared = _prepared(exp, prepared)
     models = list(exp.cache.prefetch) if exp.cache else []
     print(f"building image {prepared.fingerprint} on Modal (no GPU)", flush=True)
@@ -119,13 +120,13 @@ def run(
     run_name: str,
     prepared: Prepared | None = None,
 ) -> Path:
-    if not exp.gpu or not exp.image:
-        raise RunError("modal target requires gpu and image")
+    if not exp.gpu or not (exp.image or exp.dockerfile):
+        raise RunError("modal target requires gpu and an image or dockerfile")
     prepared = _prepared(exp, prepared)
 
     local_dir = _local_destination(exp.output, run_name)
     print(
-        f"submitting to Modal: gpu={exp.gpu} image={exp.image} "
+        f"submitting to Modal: gpu={exp.gpu} image={exp.image or exp.dockerfile} "
         f"fingerprint={prepared.fingerprint} volume={VOLUME_NAME}",
         flush=True,
     )

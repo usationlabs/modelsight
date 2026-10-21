@@ -6,7 +6,7 @@ import pytest
 from modelsight.config import (
     Cache,
     ConfigError,
-    GitSource,
+    Source,
     experiment_from_mapping,
     load_experiment,
     parse_duration,
@@ -74,6 +74,7 @@ def test_bad_ready_url_is_rejected(tmp_path: Path) -> None:
 
 
 MODAL_BASE = "target: modal\ngpu: B200:8\nimage: nvidia/cuda:13.2.1-devel-ubuntu24.04\nserver: serve\nbench: bench\n"
+DOCKERFILE_BASE = "target: modal\ngpu: B200:8\nserver: serve\nbench: bench\n"
 
 
 def _load(tmp_path: Path, text: str):
@@ -82,45 +83,62 @@ def _load(tmp_path: Path, text: str):
     return load_experiment(path)
 
 
+def _with_dockerfile(tmp_path: Path, extra: str = "", where: str = "Dockerfile"):
+    dockerfile = tmp_path / where
+    dockerfile.parent.mkdir(parents=True, exist_ok=True)
+    dockerfile.write_text("FROM scratch\n")
+    return _load(tmp_path, DOCKERFILE_BASE + f"dockerfile: {where}\n" + extra)
+
+
 def test_new_sections_are_optional(tmp_path: Path) -> None:
     experiment, _ = _load(tmp_path, MODAL_BASE)
-    assert experiment.build is None
+    assert experiment.dockerfile is None
+    assert experiment.build_args == ()
+    assert experiment.sources == ()
     assert experiment.cache is None
     assert experiment.secrets == ()
     assert experiment.report == ()
 
 
-def test_build_steps_accept_commands_and_git_sources(tmp_path: Path) -> None:
-    experiment, _ = _load(
+def test_dockerfile_is_resolved_relative_to_the_experiment_file(tmp_path: Path) -> None:
+    experiment, _ = _with_dockerfile(tmp_path, where="images/Dockerfile")
+    assert experiment.dockerfile == str((tmp_path / "images" / "Dockerfile").resolve())
+    assert experiment.image is None
+
+
+def test_missing_dockerfile_is_an_error(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="not found"):
+        _load(tmp_path, DOCKERFILE_BASE + "dockerfile: Nope\n")
+
+
+def test_modal_needs_image_or_dockerfile_but_not_both(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="image or dockerfile is required"):
+        _load(tmp_path, "target: modal\ngpu: B200\nserver: s\nbench: b\n")
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
+    with pytest.raises(ConfigError, match="not both"):
+        _load(tmp_path, MODAL_BASE + "dockerfile: Dockerfile\n")
+
+
+def test_sources_and_build_args(tmp_path: Path) -> None:
+    experiment, _ = _with_dockerfile(
         tmp_path,
-        MODAL_BASE
-        + """build:
-  env:
-    FOO: bar
-    COUNT: 3
-  gpu: B200
-  secrets: [GH_TOKEN]
-  steps:
-    - apt-get install -y git
-    - git:
-        repo: https://github.com/usationlabs/dynamo
-        path: /opt/dynamo
-        ref: feat/deepinfer
-    - git:
-        repo: https://github.com/deepseek-ai/DeepInfer
-        path: /opt/DeepInfer
+        """add_python: "3.12"
+build_args:
+  JOBS: 8
+  NOTE: hello
+sources:
+  DYNAMO:
+    repo: https://github.com/usationlabs/dynamo
+    ref: feat/deepinfer
+  ENGINE: {repo: https://github.com/org/engine}
 """,
     )
-    build = experiment.build
-    assert build is not None
-    assert build.steps[0] == "apt-get install -y git"
-    assert build.steps[1] == GitSource(
-        "https://github.com/usationlabs/dynamo", "/opt/dynamo", "feat/deepinfer"
+    assert experiment.add_python == "3.12"
+    assert experiment.build_args == (("JOBS", "8"), ("NOTE", "hello"))
+    assert experiment.sources == (
+        Source("DYNAMO", "https://github.com/usationlabs/dynamo", "feat/deepinfer"),
+        Source("ENGINE", "https://github.com/org/engine", "main"),  # the default ref
     )
-    assert build.steps[2].ref == "main"  # the default
-    assert build.env == (("FOO", "bar"), ("COUNT", "3"))
-    assert build.gpu == "B200"
-    assert build.secrets == ("GH_TOKEN",)
 
 
 def test_cache_defaults(tmp_path: Path) -> None:
@@ -140,29 +158,41 @@ def test_secrets_and_report(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "extra, message",
     [
-        ("build: {}\n", "build.steps"),
-        ("build:\n  steps: []\n", "build.steps"),
-        ("build:\n  steps: [ls]\n  nope: 1\n", "build.nope"),
-        ("build:\n  steps: [3]\n", "build.steps[0]"),
-        ("build:\n  steps:\n    - git: {repo: git@github.com:a/b, path: /x}\n", "https://"),
-        ("build:\n  steps:\n    - git: {repo: https://github.com/a/b, path: x}\n", "absolute"),
-        ("build:\n  steps:\n    - git: {repo: https://github.com/a/b}\n", "path"),
-        ("build:\n  steps:\n    - git: {repo: https://github.com/a/b, path: /x, sha: 1}\n", "sha"),
-        ("build:\n  steps: [ls]\n  env: {'bad-name': 1}\n", "bad-name"),
-        ("build:\n  steps: [ls]\n  secrets: ['not a name']\n", "environment variable"),
+        ("sources: [a]\n", "sources must be a mapping"),
+        ("sources:\n  lower: {repo: https://x/r}\n", "upper case"),
+        ("sources:\n  A: {repo: git@github.com:a/b}\n", "https://"),
+        ("sources:\n  A: {ref: main}\n", "repo"),
+        ("sources:\n  A: {repo: https://x/r, sha: 1}\n", "sources.A.sha"),
+        ("build_args: [a]\n", "build_args must be a mapping"),
+        ("build_args: {'bad-name': 1}\n", "bad-name"),
+        ("build_args: {A_SHA: x}\nsources:\n  A: {repo: https://x/r}\n", "A_SHA"),
         ("cache:\n  mount: relative\n", "absolute"),
         ("cache:\n  size: 1\n", "cache.size"),
         ("secrets: HF_TOKEN\n", "list of strings"),
+        ("secrets: ['not a name']\n", "environment variable"),
         ("report: [3]\n", "non-empty strings"),
     ],
 )
-def test_invalid_new_sections_are_rejected(tmp_path: Path, extra: str, message: str) -> None:
+def test_invalid_sections_are_rejected(tmp_path: Path, extra: str, message: str) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
     with pytest.raises(ConfigError, match=re.escape(message)):
-        _load(tmp_path, MODAL_BASE + extra)
+        _load(tmp_path, DOCKERFILE_BASE + "dockerfile: Dockerfile\n" + extra)
+
+
+def test_sources_need_a_dockerfile(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="dockerfile is required"):
+        _load(tmp_path, MODAL_BASE + "sources:\n  A: {repo: https://x/r}\n")
 
 
 @pytest.mark.parametrize(
-    "extra", ["build:\n  steps: [ls]\n", "cache:\n  prefetch: [a/b]\n", "secrets: [HF_TOKEN]\n"]
+    "extra",
+    [
+        "dockerfile: Dockerfile\n",
+        "build_args: {A: b}\n",
+        "add_python: '3.12'\n",
+        "cache:\n  prefetch: [a/b]\n",
+        "secrets: [HF_TOKEN]\n",
+    ],
 )
 def test_local_target_rejects_modal_only_sections(tmp_path: Path, extra: str) -> None:
     with pytest.raises(ConfigError, match="only supported when target is modal"):
@@ -175,22 +205,18 @@ def test_report_is_allowed_locally(tmp_path: Path) -> None:
 
 
 def test_to_mapping_round_trips(tmp_path: Path) -> None:
-    experiment, _ = _load(
+    experiment, _ = _with_dockerfile(
         tmp_path,
-        MODAL_BASE
-        + """secrets: [HF_TOKEN]
+        """add_python: "3.12"
+secrets: [HF_TOKEN]
 report: [uname -a]
 cache:
   prefetch: [org/model]
   volume: weights
   mount: /w
-build:
-  env: {A: b}
-  gpu: B200
-  secrets: [GH_TOKEN]
-  steps:
-    - echo hi
-    - git: {repo: https://github.com/a/b, path: /opt/b, ref: dev}
+build_args: {A: b}
+sources:
+  DYNAMO: {repo: https://github.com/a/b, ref: dev}
 """,
     )
     assert experiment_from_mapping(experiment.to_mapping()) == experiment

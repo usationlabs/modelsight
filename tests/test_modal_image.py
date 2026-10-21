@@ -1,11 +1,12 @@
-"""The Modal target turns planned layers into image calls; Modal itself is faked."""
+"""The Modal target turns the plan into image calls; Modal itself is faked."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from modelsight.build import install_commands, prepare
-from modelsight.config import Build, Cache, Experiment, GitSource
+from modelsight.config import Cache, Experiment, Source
 from modelsight.targets import modal as target
 
 SHA = "d" * 40
@@ -25,15 +26,18 @@ class FakeImage:
         self.calls = calls
 
     @classmethod
-    def from_registry(cls, ref: str) -> "FakeImage":
-        return cls([("from_registry", ref)])
+    def from_registry(cls, ref: str, add_python=None) -> "FakeImage":
+        return cls([("from_registry", ref, add_python)])
+
+    @classmethod
+    def from_dockerfile(cls, path, *, context_dir, build_args, add_python=None) -> "FakeImage":
+        return cls([("from_dockerfile", Path(path), Path(context_dir), build_args, add_python)])
 
     def env(self, values: dict[str, str]) -> "FakeImage":
         return FakeImage([*self.calls, ("env", values)])
 
-    def run_commands(self, command: str, secrets=None, gpu=None) -> "FakeImage":
-        names = [list(secret.values) for secret in secrets or []]
-        return FakeImage([*self.calls, ("run", command, names, gpu)])
+    def run_commands(self, command: str) -> "FakeImage":
+        return FakeImage([*self.calls, ("run", command)])
 
     def add_local_python_source(self, name: str) -> "FakeImage":
         return FakeImage([*self.calls, ("mount", name)])
@@ -62,34 +66,40 @@ def _experiment(**overrides) -> Experiment:
     return Experiment(**values)
 
 
-def test_image_starts_from_the_base_and_mounts_modelsight_last() -> None:
+def test_registry_image_gets_ms_tooling_and_the_modelsight_mount() -> None:
     exp = _experiment()
     calls = target.build_image(exp, prepare(exp)).calls
-    assert calls[0] == ("from_registry", exp.image)
+    assert calls[0] == ("from_registry", exp.image, None)
     assert calls[-1] == ("mount", "modelsight")
-    commands = [call[1] for call in calls if call[0] == "run"]
-    assert commands == install_commands()
+    assert [call[1] for call in calls if call[0] == "run"] == install_commands()
 
 
-def test_build_steps_become_layers_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GH_TOKEN", "ghp_value")
+def test_dockerfile_is_built_with_its_directory_as_context_and_resolved_args(
+    tmp_path: Path,
+) -> None:
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\n")
     exp = _experiment(
-        build=Build(
-            steps=("echo one", 'curl -H "T: $GH_TOKEN" x', GitSource("https://x/r", "/opt/r", "dev")),
-            env=(("A", "b"),),
-            gpu="B200",
-            secrets=("GH_TOKEN",),
-        ),
+        image=None,
+        dockerfile=str(dockerfile),
+        add_python="3.12",
+        build_args=(("JOBS", "8"),),
+        sources=(Source("DYNAMO", "https://x/dynamo", "feat/deepinfer"),),
         cache=Cache(),
     )
     calls = target.build_image(exp, prepare(exp, lambda repo, ref: SHA)).calls
-    tooling = len(install_commands())
-    own = calls[1 + tooling : -1]
-    assert own[0] == ("env", {"A": "b"})
-    assert own[1] == ("run", "echo one", [], "B200")
-    assert own[2] == ("run", 'curl -H "T: $GH_TOKEN" x', [["GH_TOKEN"]], "B200")
-    assert own[3][0] == "run" and SHA in own[3][1]
-    assert own[4] == ("env", {"HF_HOME": "/cache/huggingface"})
+    kind, path, context, args, add_python = calls[0]
+    assert kind == "from_dockerfile"
+    assert path == dockerfile and context == tmp_path
+    assert args == {
+        "JOBS": "8",
+        "DYNAMO_REPO": "https://x/dynamo",
+        "DYNAMO_REF": "feat/deepinfer",
+        "DYNAMO_SHA": SHA,
+    }
+    assert add_python == "3.12"
+    assert calls[-2] == ("env", {"HF_HOME": "/cache/huggingface"})
+    assert calls[-1] == ("mount", "modelsight")
 
 
 def test_runtime_secrets_come_from_local_environment(monkeypatch: pytest.MonkeyPatch) -> None:

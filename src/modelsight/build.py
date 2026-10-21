@@ -1,11 +1,14 @@
-"""Plan the Modal image: resolve git refs, list the layers, fingerprint them.
+"""Plan the Modal image: resolve git refs, list the layers ms adds, fingerprint.
 
-Nothing here talks to Modal, so it can be tested and dry-run without an
-account. Modal caches an image layer by its content: if the base image and the
-commands up to a layer are unchanged, that layer is reused. The fingerprint is
-a hash of the same inputs, so a run can say whether it will reuse the cache.
-Git refs are resolved to commit SHAs first, so a branch that moved changes the
-layer that clones it, and only that layer and the ones after it.
+The image comes from either a registry `image` or a Dockerfile. Nothing here
+talks to Modal, so it can be tested and dry-run without an account.
+
+Modal caches an image layer by its content: if the base and the instructions up
+to a layer are unchanged, that layer is reused. `sources` give a Dockerfile git
+repositories at a moving ref; each ref is resolved to a commit SHA first and
+passed as a build arg, so a branch that moved changes the layer that uses it,
+and only that layer and the ones after it. The fingerprint hashes the same
+inputs, so a run can say whether it will reuse the cache.
 """
 
 from __future__ import annotations
@@ -14,12 +17,12 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
-from modelsight.config import Experiment, GitSource
+from modelsight.config import Experiment
 
 # Pinned so image builds stay reproducible. Bump deliberately.
 UV_VERSION = "0.12.5"
@@ -33,43 +36,48 @@ class BuildError(Exception):
 
 
 @dataclass(frozen=True)
-class ResolvedGit:
+class ResolvedSource:
+    name: str
     repo: str
-    path: str
     ref: str
     sha: str
 
+    def build_args(self) -> tuple[tuple[str, str], ...]:
+        return (
+            (f"{self.name}_REPO", self.repo),
+            (f"{self.name}_REF", self.ref),
+            (f"{self.name}_SHA", self.sha),
+        )
 
-Step = str | ResolvedGit
+
 Resolver = Callable[[str, str], str]
 
 
 @dataclass(frozen=True)
 class Layer:
-    """One Modal image method call: a shell command, or a set of env vars."""
+    """One Modal image method call added after the base: a command or env vars."""
 
     kind: str  # "run" or "env"
     command: str = ""
     env: tuple[tuple[str, str], ...] = ()
-    # Names of local environment variables made available to this command only.
-    secrets: tuple[str, ...] = ()
-    gpu: str | None = None
 
 
 @dataclass(frozen=True)
 class Prepared:
-    steps: tuple[Step, ...]
+    build_args: tuple[tuple[str, str], ...]
+    sources: tuple[ResolvedSource, ...]
     layers: tuple[Layer, ...]
     fingerprint: str
 
     def info_text(self, exp: Experiment) -> str:
         """Lines for env.txt: what the image was built from."""
         lines = [f"image_fingerprint: {self.fingerprint}"]
-        for step in self.steps:
-            if isinstance(step, ResolvedGit):
-                lines.append(
-                    f"source {step.path}: {step.repo} {step.ref} -> {step.sha}"
-                )
+        if exp.dockerfile:
+            lines.append(f"dockerfile: {Path(exp.dockerfile).name}")
+        for source in self.sources:
+            lines.append(
+                f"source {source.name}: {source.repo} {source.ref} -> {source.sha}"
+            )
         if exp.secrets:
             lines.append(f"secrets (names only): {', '.join(exp.secrets)}")
         return "\n".join(lines) + "\n"
@@ -127,65 +135,39 @@ def resolve_ref(
     raise BuildError(f"{ref!r} is not a branch or tag of {repo}{hint}")
 
 
-def resolve_steps(
-    steps: tuple[str | GitSource, ...], resolver: Resolver | None = None
-) -> tuple[Step, ...]:
+def resolve_sources(
+    exp: Experiment, resolver: Resolver | None = None
+) -> tuple[ResolvedSource, ...]:
     resolver = resolver or resolve_ref
-    resolved: list[Step] = []
-    seen: dict[tuple[str, str], str] = {}
-    for step in steps:
-        if isinstance(step, str):
-            resolved.append(step)
-            continue
-        key = (step.repo, step.ref)
-        if key not in seen:
-            seen[key] = resolver(step.repo, step.ref)
-        resolved.append(ResolvedGit(step.repo, step.path, step.ref, seen[key]))
-    return tuple(resolved)
-
-
-def step_command(step: Step) -> str:
-    """The shell command for a step. A git step fetches exactly one commit."""
-    if isinstance(step, str):
-        return step
-    path = shlex.quote(step.path)
-    return " && ".join(
-        [
-            f"git init -q {path}",
-            f"git -C {path} remote add origin {shlex.quote(step.repo)}",
-            f"git -C {path} fetch -q --depth 1 origin {step.sha}",
-            f"git -C {path} checkout -q FETCH_HEAD",
-        ]
+    return tuple(
+        ResolvedSource(source.name, source.repo, source.ref, resolver(source.repo, source.ref))
+        for source in exp.sources
     )
 
 
-def plan_layers(exp: Experiment, steps: tuple[Step, ...]) -> tuple[Layer, ...]:
-    """Layers in build order: ms tooling first, then the experiment's own."""
+def plan_layers(exp: Experiment) -> tuple[Layer, ...]:
+    """Layers ms adds after the base: its own tooling, then the cache env."""
     layers = [Layer("run", command) for command in install_commands()]
-    if exp.build:
-        if exp.build.env:
-            layers.append(Layer("env", env=exp.build.env))
-        for step in steps:
-            command = step_command(step)
-            used = tuple(
-                name
-                for name in exp.build.secrets
-                if re.search(rf"\${{?{re.escape(name)}\b", command)
-            )
-            layers.append(Layer("run", command, secrets=used, gpu=exp.build.gpu))
     if exp.cache:
         layers.append(Layer("env", env=(("HF_HOME", f"{exp.cache.mount}/huggingface"),)))
     return tuple(layers)
 
 
-def fingerprint(image: str | None, layers: tuple[Layer, ...]) -> str:
+def fingerprint(
+    exp: Experiment,
+    dockerfile_text: str | None,
+    build_args: tuple[tuple[str, str], ...],
+    layers: tuple[Layer, ...],
+) -> str:
+    """A hash of what determines the image. Files COPY'd from the build context
+    are not included, only the Dockerfile text."""
     payload = json.dumps(
         {
-            "image": image,
-            "layers": [
-                [layer.kind, layer.command, layer.env, layer.secrets, layer.gpu]
-                for layer in layers
-            ],
+            "image": exp.image,
+            "dockerfile": dockerfile_text,
+            "build_args": sorted(build_args),
+            "add_python": exp.add_python,
+            "layers": [[layer.kind, layer.command, layer.env] for layer in layers],
         },
         sort_keys=True,
     )
@@ -193,19 +175,21 @@ def fingerprint(image: str | None, layers: tuple[Layer, ...]) -> str:
 
 
 def prepare(exp: Experiment, resolver: Resolver | None = None) -> Prepared:
-    steps = (
-        resolve_steps(exp.build.steps, resolver or resolve_ref) if exp.build else ()
+    sources = resolve_sources(exp, resolver)
+    dockerfile_text = None
+    if exp.dockerfile:
+        try:
+            dockerfile_text = Path(exp.dockerfile).read_text()
+        except OSError as exc:
+            raise BuildError(f"could not read dockerfile {exp.dockerfile}: {exc}") from exc
+    build_args = exp.build_args + tuple(arg for source in sources for arg in source.build_args())
+    layers = plan_layers(exp)
+    return Prepared(
+        build_args, sources, layers, fingerprint(exp, dockerfile_text, build_args, layers)
     )
-    layers = plan_layers(exp, steps)
-    return Prepared(steps, layers, fingerprint(exp.image, layers))
 
 
-def missing_env(
-    exp: Experiment, prepared: Prepared, environ: Mapping[str, str] | None = None
-) -> list[str]:
+def missing_env(exp: Experiment, environ: Mapping[str, str] | None = None) -> list[str]:
     """Names of local variables the run needs that are unset or empty."""
     env = os.environ if environ is None else environ
-    needed = list(exp.secrets)
-    for layer in prepared.layers:
-        needed.extend(layer.secrets)
-    return sorted({name for name in needed if not env.get(name)})
+    return sorted({name for name in exp.secrets if not env.get(name)})

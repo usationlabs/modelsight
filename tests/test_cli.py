@@ -90,21 +90,25 @@ def test_dry_run_skips_check_for_other_bench_tools(tmp_path: Path) -> None:
 SHA = "c" * 40
 DEEPINFER_YAML = """target: modal
 gpu: B200:8
-image: nvidia/cuda:13.2.1-devel-ubuntu24.04
+dockerfile: Dockerfile
 secrets: [HF_TOKEN]
 report: [uname -a]
 cache:
   prefetch: [org/model]
-build:
-  steps:
-    - echo setting up
-    - git:
-        repo: https://github.com/usationlabs/dynamo
-        path: /opt/dynamo
-        ref: feat/deepinfer
+sources:
+  DYNAMO:
+    repo: https://github.com/usationlabs/dynamo
+    ref: feat/deepinfer
 server: serve
 bench: bench
 """
+
+
+def _deepinfer_config(tmp_path: Path) -> Path:
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
+    config = tmp_path / "exp.yaml"
+    config.write_text(DEEPINFER_YAML)
+    return config
 
 
 @pytest.fixture
@@ -123,13 +127,12 @@ def test_dry_run_shows_the_image_plan_and_resolved_refs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
 ) -> None:
     monkeypatch.setenv("HF_TOKEN", "hf_secret_value")
-    config = tmp_path / "exp.yaml"
-    config.write_text(DEEPINFER_YAML)
+    config = _deepinfer_config(tmp_path)
     result = runner.invoke(app, ["run", "-f", str(config), "--dry-run"])
     assert result.exit_code == 0, result.stdout
     assert "image_fingerprint:" in result.stdout
-    assert "build: 2 steps" in result.stdout
-    assert f"git https://github.com/usationlabs/dynamo feat/deepinfer -> {SHA} at /opt/dynamo" in result.stdout
+    assert "dockerfile:" in result.stdout
+    assert f"source DYNAMO: https://github.com/usationlabs/dynamo feat/deepinfer -> {SHA}" in result.stdout
     assert "cache: volume=modelsight-cache mount=/cache prefetch=org/model" in result.stdout
     assert "secrets: HF_TOKEN (set)" in result.stdout
     assert "report: 1 commands" in result.stdout
@@ -141,8 +144,7 @@ def test_dry_run_flags_missing_secrets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
 ) -> None:
     monkeypatch.delenv("HF_TOKEN", raising=False)
-    config = tmp_path / "exp.yaml"
-    config.write_text(DEEPINFER_YAML)
+    config = _deepinfer_config(tmp_path)
     result = runner.invoke(app, ["run", "-f", str(config), "--dry-run"])
     assert result.exit_code == 0
     assert "secrets: HF_TOKEN (missing)" in result.stdout
@@ -155,8 +157,7 @@ def test_unresolvable_ref_stops_before_anything_launches(
         raise BuildError(f"{ref!r} is not a branch or tag of {repo}")
 
     monkeypatch.setattr("modelsight.build.resolve_ref", fail)
-    config = tmp_path / "exp.yaml"
-    config.write_text(DEEPINFER_YAML)
+    config = _deepinfer_config(tmp_path)
     result = runner.invoke(app, ["run", "-f", str(config)])
     assert result.exit_code == 1
     assert "not a branch or tag" in result.stderr
@@ -168,8 +169,7 @@ def test_run_refuses_to_start_without_required_env(
     monkeypatch.delenv("HF_TOKEN", raising=False)
     launched = []
     monkeypatch.setattr("modelsight.cli.modal.run", lambda *a, **k: launched.append(a))
-    config = tmp_path / "exp.yaml"
-    config.write_text(DEEPINFER_YAML)
+    config = _deepinfer_config(tmp_path)
     result = runner.invoke(app, ["run", "-f", str(config)])
     assert result.exit_code == 1
     assert "HF_TOKEN" in result.stderr
@@ -187,20 +187,18 @@ def test_run_passes_the_prepared_image_to_modal(
         return tmp_path / "results"
 
     monkeypatch.setattr("modelsight.cli.modal.run", fake_run)
-    config = tmp_path / "exp.yaml"
-    config.write_text(DEEPINFER_YAML)
+    config = _deepinfer_config(tmp_path)
     result = runner.invoke(app, ["run", "-f", str(config)])
     assert result.exit_code == 0, result.stdout
     assert len(seen["prepared"].fingerprint) == 12
-    assert any(getattr(step, "sha", None) == SHA for step in seen["prepared"].steps)
+    assert ("DYNAMO_SHA", SHA) in seen["prepared"].build_args
 
 
 def test_build_dry_run_prints_the_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
 ) -> None:
     monkeypatch.setenv("HF_TOKEN", "x")
-    config = tmp_path / "exp.yaml"
-    config.write_text(DEEPINFER_YAML)
+    config = _deepinfer_config(tmp_path)
     result = runner.invoke(app, ["build", "-f", str(config), "--dry-run"])
     assert result.exit_code == 0, result.stdout
     assert "image_fingerprint:" in result.stdout
@@ -212,8 +210,7 @@ def test_build_calls_modal_build(
     monkeypatch.setenv("HF_TOKEN", "x")
     built = []
     monkeypatch.setattr("modelsight.cli.modal.build", lambda exp, prepared: built.append(prepared))
-    config = tmp_path / "exp.yaml"
-    config.write_text(DEEPINFER_YAML)
+    config = _deepinfer_config(tmp_path)
     result = runner.invoke(app, ["build", "-f", str(config)])
     assert result.exit_code == 0, result.stdout
     assert len(built) == 1
