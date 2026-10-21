@@ -273,3 +273,89 @@ def test_detach_is_rejected_for_local_runs(tmp_path: Path) -> None:
     result = runner.invoke(app, ["run", "-f", str(config), "--detach"])
     assert result.exit_code == 1
     assert "target: modal" in result.stderr
+
+
+def _saved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str = "my-run", kind: str = "run"):
+    from modelsight.runs import RunState, save_state
+
+    monkeypatch.chdir(tmp_path)
+    state = RunState(
+        kind=kind,
+        name=name,
+        app_id="ap-1",
+        function_call_id="fc-1",
+        profile=None,
+        output=str(tmp_path / "results"),
+        volume="modelsight-results",
+        started_at="2026-10-21T19:49:51",
+    )
+    save_state(state)
+    return state
+
+
+def test_attach_without_a_name_lists_the_saved_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _saved(tmp_path, monkeypatch, "run-one")
+    _saved(tmp_path, monkeypatch, "build-two", kind="build")
+    result = runner.invoke(app, ["attach"])
+    assert result.exit_code == 0
+    assert "run-one  run  app ap-1" in result.stdout
+    assert "build-two  build" in result.stdout
+
+
+def test_attach_with_nothing_saved_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["attach"])
+    assert result.exit_code == 0
+    assert "no detached runs saved here" in result.stdout
+
+
+def test_attach_reconnects_and_prints_where_the_results_went(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _saved(tmp_path, monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        "modelsight.cli.modal.attach",
+        lambda s, logs=True: seen.append((s, logs)) or tmp_path / "results" / "my-run",
+    )
+    result = runner.invoke(app, ["attach", "my-run", "--no-logs"])
+    assert result.exit_code == 0, result.stdout
+    assert seen == [(state, False)]
+    assert f"results: {tmp_path / 'results' / 'my-run'}" in result.stdout
+
+
+def test_attach_to_a_build_prints_no_results_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _saved(tmp_path, monkeypatch, "build-x", kind="build")
+    monkeypatch.setattr("modelsight.cli.modal.attach", lambda s, logs=True: None)
+    result = runner.invoke(app, ["attach", "build-x"])
+    assert result.exit_code == 0
+    assert "results:" not in result.stdout
+
+
+def test_attach_to_an_unknown_run_fails_clearly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["attach", "nope"])
+    assert result.exit_code == 1
+    assert "no saved run 'nope'" in result.stderr
+
+
+def test_attach_reports_a_lost_connection_as_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from modelsight.runner import RunError
+
+    _saved(tmp_path, monkeypatch)
+
+    def lost(state, logs=True):
+        raise RunError("lost the connection to Modal. Reconnect with: ms attach my-run")
+
+    monkeypatch.setattr("modelsight.cli.modal.attach", lost)
+    result = runner.invoke(app, ["attach", "my-run"])
+    assert result.exit_code == 1
+    assert "ms attach my-run" in result.stderr

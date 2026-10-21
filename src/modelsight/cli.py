@@ -13,6 +13,7 @@ from modelsight import build as image_plan
 from modelsight.build import BuildError, Prepared
 from modelsight.config import ConfigError, Experiment, load_experiment
 from modelsight.runner import RunError, aiperf_status
+from modelsight.runs import StateError, list_states, load_state
 from modelsight.targets import local, modal
 
 app = typer.Typer(
@@ -112,7 +113,13 @@ def run(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1) from exc
     except KeyboardInterrupt:
-        typer.echo("interrupted; server was shut down", err=True)
+        if detach:
+            typer.echo(
+                f"interrupted; the run is still going on Modal. Reconnect with: ms attach {name}",
+                err=True,
+            )
+        else:
+            typer.echo("interrupted; server was shut down", err=True)
         raise typer.Exit(130) from None
     typer.echo(f"results: {run_dir}")
 
@@ -251,3 +258,38 @@ def build(
 def version() -> None:
     """Print the modelsight version."""
     typer.echo(__version__)
+
+
+@app.command()
+def attach(
+    run: str = typer.Argument(
+        None,
+        help="Run name (or saved state file). Omit it to list the runs started from this directory.",
+    ),
+    logs: bool = typer.Option(
+        True, "--logs/--no-logs", help="Stream the run's logs while waiting."
+    ),
+) -> None:
+    """Reconnect to a detached Modal run or build: stream logs, wait, fetch results."""
+    if run is None:
+        states = list_states()
+        if not states:
+            typer.echo("no detached runs saved here (they are kept in .ms/runs/)")
+            return
+        for state in states:
+            typer.echo(f"{state.name}  {state.kind}  app {state.app_id}  started {state.started_at}")
+        return
+    try:
+        state = load_state(run)
+    except StateError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    try:
+        results = modal.attach(state, logs=logs)
+    except RunError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    if results is not None:
+        typer.echo(f"results: {results}")
