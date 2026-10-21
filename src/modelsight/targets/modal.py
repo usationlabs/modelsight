@@ -164,6 +164,7 @@ def build(
     )
     def prepare_remote(models: list[str]) -> None:
         import subprocess
+        import time
 
         for model in models:
             print(f"downloading {model}", flush=True)
@@ -172,7 +173,11 @@ def build(
                 check=True,
             )
         if cache_volume is not None:
+            # Not bounded: this is what makes the download permanent.
+            print("committing the cache volume; this can take a while after a large download", flush=True)
+            started = time.monotonic()
             cache_volume.commit()
+            print(f"committed the cache volume in {time.monotonic() - started:.0f}s", flush=True)
 
     state = None
     try:
@@ -250,7 +255,7 @@ def run(
         from pathlib import Path
 
         from modelsight.config import experiment_from_mapping
-        from modelsight.runner import execute_run
+        from modelsight.runner import commit_with_timeout, execute_run
 
         experiment = experiment_from_mapping(mapping)
         try:
@@ -261,13 +266,11 @@ def run(
                 extra_env=info_text,
             )
         finally:
-            for mounted in (volume, cache_volume):
-                if mounted is None:
-                    continue
-                try:
-                    mounted.commit()
-                except Exception as exc:
-                    print(f"warning: could not commit a volume: {exc}", flush=True)
+            # The results first, then the cache. Each commit is bounded and timed so
+            # a slow one cannot keep the GPUs idle once the run is over.
+            for label, mounted in (("results", volume), ("cache", cache_volume)):
+                if mounted is not None:
+                    commit_with_timeout(label, mounted)
 
     state = None
     try:

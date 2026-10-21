@@ -204,3 +204,47 @@ def test_env_txt_includes_extra_text_and_report(tmp_path: Path) -> None:
     env_txt = (run_dir / "env.txt").read_text()
     assert "image_fingerprint: abc\n" in env_txt
     assert "$ echo revision-1\nrevision-1\n" in env_txt
+
+
+class _Volume:
+    def __init__(self, action) -> None:
+        self.action = action
+        self.commits = 0
+
+    def commit(self) -> None:
+        self.commits += 1
+        self.action()
+
+
+def test_a_quick_commit_is_reported_with_its_time(capsys: pytest.CaptureFixture[str]) -> None:
+    from modelsight.runner import commit_with_timeout
+
+    volume = _Volume(lambda: None)
+    assert commit_with_timeout("results", volume, timeout=5) is True
+    assert volume.commits == 1
+    assert "committed the results volume in" in capsys.readouterr().out
+
+
+def test_a_failing_commit_is_a_warning_not_a_crash(capsys: pytest.CaptureFixture[str]) -> None:
+    from modelsight.runner import commit_with_timeout
+
+    def boom() -> None:
+        raise RuntimeError("volume gone")
+
+    assert commit_with_timeout("cache", _Volume(boom), timeout=5) is False
+    assert "could not commit the cache volume: volume gone" in capsys.readouterr().out
+
+
+def test_a_slow_commit_is_abandoned_so_it_cannot_hold_the_gpus(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from modelsight.runner import commit_with_timeout
+
+    release = threading.Event()
+    started = time.monotonic()
+    done = commit_with_timeout("cache", _Volume(lambda: release.wait(30)), timeout=0.3)
+    elapsed = time.monotonic() - started
+    release.set()  # let the stuck worker thread finish
+    assert done is False
+    assert elapsed < 5, "must return near the timeout, not wait for the commit"
+    assert "still running after 0.3s; not waiting any longer" in capsys.readouterr().out

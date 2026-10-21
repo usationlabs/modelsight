@@ -25,6 +25,9 @@ _POLL_SECONDS = 1
 # that hits the cap can still stop the server and flush results before Modal
 # kills the container.
 MODAL_TIMEOUT_BUFFER_SECONDS = 120
+# A volume commit that takes longer than this is abandoned, so a slow one cannot
+# hold a GPU container idle after the run is over.
+COMMIT_TIMEOUT_SECONDS = 180
 
 
 class RunError(Exception):
@@ -90,6 +93,40 @@ def execute_run(
         print("stopping server", flush=True)
         stop_process(server)
         server_log.close()
+
+
+def commit_with_timeout(label: str, volume, timeout: float = COMMIT_TIMEOUT_SECONDS) -> bool:
+    """Commit a Modal volume, but give up waiting after `timeout` seconds.
+
+    Prints how long it took, so a slow commit is visible in the run's log.
+    Returns True only if the commit finished cleanly.
+    """
+    outcome: list[BaseException | None] = []
+
+    def work() -> None:
+        try:
+            volume.commit()
+            outcome.append(None)
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            outcome.append(exc)
+
+    started = time.monotonic()
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    took = time.monotonic() - started
+    if thread.is_alive():
+        print(
+            f"warning: committing the {label} volume is still running after {timeout:g}s; "
+            "not waiting any longer",
+            flush=True,
+        )
+        return False
+    if outcome and outcome[0] is not None:
+        print(f"warning: could not commit the {label} volume: {outcome[0]}", flush=True)
+        return False
+    print(f"committed the {label} volume in {took:.1f}s", flush=True)
+    return True
 
 
 def aiperf_status(exp: Experiment) -> str:
