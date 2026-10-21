@@ -44,12 +44,20 @@ def allocate_run_dir(output: str, run_name: str) -> Path:
     return run_dir
 
 
-def execute_run(exp: Experiment, run_dir: Path, config_text: str) -> None:
-    """Run one experiment inside `run_dir`. Used on this machine and inside Modal."""
+def execute_run(
+    exp: Experiment, run_dir: Path, config_text: str, extra_env: str = ""
+) -> None:
+    """Run one experiment inside `run_dir`. Used on this machine and inside Modal.
+
+    `extra_env` is extra text for env.txt, such as what the Modal image was
+    built from.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "exp.yaml").write_text(config_text)
     (run_dir / "commands.txt").write_text(f"server: {exp.server}\nbench: {exp.bench}\n")
-    (run_dir / "env.txt").write_text(environment_report(exp.image))
+    (run_dir / "env.txt").write_text(
+        environment_report(exp.image) + extra_env + report_section(exp.report)
+    )
 
     deadline = time.monotonic() + exp.timeout_seconds
     server, server_log = start_process(
@@ -108,6 +116,32 @@ def environment_report(image: str | None) -> str:
         "nvidia-smi:",
         nvidia_smi(),
     ]
+    return "\n".join(lines) + "\n"
+
+
+def report_section(commands: tuple[str, ...], timeout: float = 60) -> str:
+    """Output of the experiment's `report` commands, for env.txt."""
+    if not commands:
+        return ""
+    lines = ["report:"]
+    for command in commands:
+        lines.append(f"$ {command}")
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            text = (result.stdout + result.stderr).strip()
+            if result.returncode != 0:
+                text = f"{text}\n(exit status {result.returncode})".strip()
+        except subprocess.TimeoutExpired:
+            text = f"(timed out after {timeout:g}s)"
+        lines.append(text or "(no output)")
     return "\n".join(lines) + "\n"
 
 

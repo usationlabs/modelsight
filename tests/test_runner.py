@@ -167,3 +167,40 @@ def test_stop_process_is_harmless_when_already_gone(tmp_path: Path) -> None:
     stop_process(proc)
     log.close()
     assert proc.returncode == 0
+
+
+def test_report_section_runs_commands_and_keeps_going_after_failures() -> None:
+    from modelsight.runner import report_section
+
+    text = report_section(("echo hello", "echo oops >&2; exit 3", "true"))
+    assert text.startswith("report:\n$ echo hello\nhello\n")
+    assert "$ echo oops >&2; exit 3\noops\n(exit status 3)\n" in text
+    assert text.endswith("$ true\n(no output)\n")
+
+
+def test_report_section_is_empty_without_commands() -> None:
+    from modelsight.runner import report_section
+
+    assert report_section(()) == ""
+
+
+def test_report_section_times_out() -> None:
+    from modelsight.runner import report_section
+
+    assert "(timed out after 0.2s)" in report_section(("sleep 5",), timeout=0.2)
+
+
+def test_env_txt_includes_extra_text_and_report(tmp_path: Path) -> None:
+    from modelsight.runner import execute_run
+
+    experiment, text = _experiment(
+        tmp_path,
+        "target: local\nserver: sleep 30\nbench: 'true'\nready_url: http://127.0.0.1:1/\n"
+        "ready_timeout: 1s\nreport: [echo revision-1]\n",
+    )
+    run_dir = tmp_path / "run"
+    with pytest.raises(RunError):  # nothing listens, but env.txt is written first
+        execute_run(experiment, run_dir, text, extra_env="image_fingerprint: abc\n")
+    env_txt = (run_dir / "env.txt").read_text()
+    assert "image_fingerprint: abc\n" in env_txt
+    assert "$ echo revision-1\nrevision-1\n" in env_txt
