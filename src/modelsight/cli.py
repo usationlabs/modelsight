@@ -9,6 +9,8 @@ from pathlib import Path
 import typer
 
 from modelsight import __version__
+from modelsight import build as image_plan
+from modelsight.build import BuildError, Prepared, ResolvedGit
 from modelsight.config import ConfigError, Experiment, load_experiment
 from modelsight.runner import RunError, aiperf_status
 from modelsight.targets import local, modal
@@ -79,18 +81,22 @@ def run(
         raise typer.Exit(1) from exc
 
     name = run_name_for(config)
+    prepared = _prepare(experiment)
     if dry_run:
-        typer.echo(dry_run_report(experiment, config, name))
+        typer.echo(dry_run_report(experiment, config, name, prepared))
         return
 
     aiperf = aiperf_status(experiment)
     if aiperf.startswith("not found"):
         typer.echo(f"error: aiperf {aiperf}", err=True)
         raise typer.Exit(1)
+    _require_env(experiment, prepared)
 
-    target = local if experiment.target == "local" else modal
     try:
-        run_dir = target.run(experiment, config_text, name)
+        if prepared is None:
+            run_dir = local.run(experiment, config_text, name)
+        else:
+            run_dir = modal.run(experiment, config_text, name, prepared)
     except RunError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1) from exc
@@ -100,7 +106,33 @@ def run(
     typer.echo(f"results: {run_dir}")
 
 
-def dry_run_report(exp: Experiment, config: Path, name: str) -> str:
+def _prepare(exp: Experiment) -> Prepared | None:
+    """Plan the Modal image, resolving git refs. None for a local run."""
+    if exp.target != "modal":
+        return None
+    try:
+        return image_plan.prepare(exp)
+    except BuildError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+
+def _require_env(exp: Experiment, prepared: Prepared | None) -> None:
+    if prepared is None:
+        return
+    missing = image_plan.missing_env(exp, prepared)
+    if missing:
+        typer.echo(
+            "error: these environment variables are needed but not set "
+            f"(export them or put them in .env): {', '.join(missing)}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+
+def dry_run_report(
+    exp: Experiment, config: Path, name: str, prepared: Prepared | None = None
+) -> str:
     output = Path(exp.output)
     if not output.is_absolute():
         output = Path.cwd() / output
@@ -118,7 +150,86 @@ def dry_run_report(exp: Experiment, config: Path, name: str) -> str:
         f"bench: {exp.bench}",
         f"aiperf: {aiperf_status(exp)}",
     ]
+    if prepared is not None:
+        lines.extend(_image_lines(exp, prepared))
     return "\n".join(lines)
+
+
+def _image_lines(exp: Experiment, prepared: Prepared) -> list[str]:
+    lines = [f"image_fingerprint: {prepared.fingerprint}"]
+    if exp.build:
+        lines.append(f"build: {len(prepared.steps)} steps")
+        for number, step in enumerate(prepared.steps, start=1):
+            if isinstance(step, ResolvedGit):
+                lines.append(
+                    f"  {number}. git {step.repo} {step.ref} -> {step.sha} at {step.path}"
+                )
+            else:
+                first = step.strip().splitlines()[0]
+                lines.append(f"  {number}. {first[:100]}{'...' if len(first) > 100 else ''}")
+    if exp.cache:
+        models = ", ".join(exp.cache.prefetch) or "-"
+        lines.append(
+            f"cache: volume={exp.cache.volume} mount={exp.cache.mount} prefetch={models}"
+        )
+    if exp.secrets:
+        missing = set(image_plan.missing_env(exp, prepared))
+        shown = ", ".join(
+            f"{name} ({'missing' if name in missing else 'set'})" for name in exp.secrets
+        )
+        lines.append(f"secrets: {shown}")
+    if exp.report:
+        lines.append(f"report: {len(exp.report)} commands")
+    return lines
+
+
+@app.command()
+def build(
+    config: Path = typer.Option(
+        ...,
+        "--config",
+        "-f",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="Experiment YAML file.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the image plan and resolved refs, without building anything.",
+    ),
+) -> None:
+    """Build the Modal image and download cache.prefetch models, without a GPU."""
+    try:
+        experiment, _ = load_experiment(config)
+    except ConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    if experiment.target != "modal":
+        typer.echo("error: ms build only applies to target: modal", err=True)
+        raise typer.Exit(1)
+    if not experiment.build and not (experiment.cache and experiment.cache.prefetch):
+        typer.echo(
+            "error: nothing to build; add a build section or cache.prefetch", err=True
+        )
+        raise typer.Exit(1)
+
+    prepared = _prepare(experiment)
+    assert prepared is not None
+    if dry_run:
+        typer.echo(dry_run_report(experiment, config, run_name_for(config), prepared))
+        return
+    _require_env(experiment, prepared)
+    try:
+        modal.build(experiment, prepared)
+    except RunError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    except KeyboardInterrupt:
+        typer.echo("interrupted", err=True)
+        raise typer.Exit(130) from None
 
 
 @app.command()

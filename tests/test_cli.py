@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from modelsight.build import BuildError
 from modelsight.cli import app, load_env_file
 
 runner = CliRunner()
@@ -84,3 +85,149 @@ def test_dry_run_skips_check_for_other_bench_tools(tmp_path: Path) -> None:
     config = _local_experiment(tmp_path, "echo hi")
     result = runner.invoke(app, ["run", "-f", str(config), "--dry-run"])
     assert "aiperf: not used by this bench command" in result.stdout
+
+
+SHA = "c" * 40
+DEEPINFER_YAML = """target: modal
+gpu: B200:8
+image: nvidia/cuda:13.2.1-devel-ubuntu24.04
+secrets: [HF_TOKEN]
+report: [uname -a]
+cache:
+  prefetch: [org/model]
+build:
+  steps:
+    - echo setting up
+    - git:
+        repo: https://github.com/usationlabs/dynamo
+        path: /opt/dynamo
+        ref: feat/deepinfer
+server: serve
+bench: bench
+"""
+
+
+@pytest.fixture
+def fake_refs(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    asked: list[tuple[str, str]] = []
+
+    def resolve(repo: str, ref: str) -> str:
+        asked.append((repo, ref))
+        return SHA
+
+    monkeypatch.setattr("modelsight.build.resolve_ref", resolve)
+    return asked
+
+
+def test_dry_run_shows_the_image_plan_and_resolved_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "hf_secret_value")
+    config = tmp_path / "exp.yaml"
+    config.write_text(DEEPINFER_YAML)
+    result = runner.invoke(app, ["run", "-f", str(config), "--dry-run"])
+    assert result.exit_code == 0, result.stdout
+    assert "image_fingerprint:" in result.stdout
+    assert "build: 2 steps" in result.stdout
+    assert f"git https://github.com/usationlabs/dynamo feat/deepinfer -> {SHA} at /opt/dynamo" in result.stdout
+    assert "cache: volume=modelsight-cache mount=/cache prefetch=org/model" in result.stdout
+    assert "secrets: HF_TOKEN (set)" in result.stdout
+    assert "report: 1 commands" in result.stdout
+    assert "hf_secret_value" not in result.stdout
+    assert fake_refs == [("https://github.com/usationlabs/dynamo", "feat/deepinfer")]
+
+
+def test_dry_run_flags_missing_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
+) -> None:
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    config = tmp_path / "exp.yaml"
+    config.write_text(DEEPINFER_YAML)
+    result = runner.invoke(app, ["run", "-f", str(config), "--dry-run"])
+    assert result.exit_code == 0
+    assert "secrets: HF_TOKEN (missing)" in result.stdout
+
+
+def test_unresolvable_ref_stops_before_anything_launches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(repo: str, ref: str) -> str:
+        raise BuildError(f"{ref!r} is not a branch or tag of {repo}")
+
+    monkeypatch.setattr("modelsight.build.resolve_ref", fail)
+    config = tmp_path / "exp.yaml"
+    config.write_text(DEEPINFER_YAML)
+    result = runner.invoke(app, ["run", "-f", str(config)])
+    assert result.exit_code == 1
+    assert "not a branch or tag" in result.stderr
+
+
+def test_run_refuses_to_start_without_required_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
+) -> None:
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    launched = []
+    monkeypatch.setattr("modelsight.cli.modal.run", lambda *a, **k: launched.append(a))
+    config = tmp_path / "exp.yaml"
+    config.write_text(DEEPINFER_YAML)
+    result = runner.invoke(app, ["run", "-f", str(config)])
+    assert result.exit_code == 1
+    assert "HF_TOKEN" in result.stderr
+    assert launched == []
+
+
+def test_run_passes_the_prepared_image_to_modal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "x")
+    seen = {}
+
+    def fake_run(exp, text, name, prepared):
+        seen["prepared"] = prepared
+        return tmp_path / "results"
+
+    monkeypatch.setattr("modelsight.cli.modal.run", fake_run)
+    config = tmp_path / "exp.yaml"
+    config.write_text(DEEPINFER_YAML)
+    result = runner.invoke(app, ["run", "-f", str(config)])
+    assert result.exit_code == 0, result.stdout
+    assert len(seen["prepared"].fingerprint) == 12
+    assert any(getattr(step, "sha", None) == SHA for step in seen["prepared"].steps)
+
+
+def test_build_dry_run_prints_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "x")
+    config = tmp_path / "exp.yaml"
+    config.write_text(DEEPINFER_YAML)
+    result = runner.invoke(app, ["build", "-f", str(config), "--dry-run"])
+    assert result.exit_code == 0, result.stdout
+    assert "image_fingerprint:" in result.stdout
+
+
+def test_build_calls_modal_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_refs
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "x")
+    built = []
+    monkeypatch.setattr("modelsight.cli.modal.build", lambda exp, prepared: built.append(prepared))
+    config = tmp_path / "exp.yaml"
+    config.write_text(DEEPINFER_YAML)
+    result = runner.invoke(app, ["build", "-f", str(config)])
+    assert result.exit_code == 0, result.stdout
+    assert len(built) == 1
+
+
+def test_build_rejects_local_target_and_empty_plans(tmp_path: Path) -> None:
+    local = tmp_path / "local.yaml"
+    local.write_text("target: local\nserver: s\nbench: b\n")
+    result = runner.invoke(app, ["build", "-f", str(local)])
+    assert result.exit_code == 1
+    assert "target: modal" in result.stderr
+
+    plain = tmp_path / "plain.yaml"
+    plain.write_text("target: modal\ngpu: B200\nimage: x\nserver: s\nbench: b\n")
+    result = runner.invoke(app, ["build", "-f", str(plain)])
+    assert result.exit_code == 1
+    assert "nothing to build" in result.stderr

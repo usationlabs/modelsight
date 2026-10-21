@@ -128,8 +128,9 @@ def resolve_ref(
 
 
 def resolve_steps(
-    steps: tuple[str | GitSource, ...], resolver: Resolver = resolve_ref
+    steps: tuple[str | GitSource, ...], resolver: Resolver | None = None
 ) -> tuple[Step, ...]:
+    resolver = resolver or resolve_ref
     resolved: list[Step] = []
     seen: dict[tuple[str, str], str] = {}
     for step in steps:
@@ -191,8 +192,10 @@ def fingerprint(image: str | None, layers: tuple[Layer, ...]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
-def prepare(exp: Experiment, resolver: Resolver = resolve_ref) -> Prepared:
-    steps = resolve_steps(exp.build.steps, resolver) if exp.build else ()
+def prepare(exp: Experiment, resolver: Resolver | None = None) -> Prepared:
+    steps = (
+        resolve_steps(exp.build.steps, resolver or resolve_ref) if exp.build else ()
+    )
     layers = plan_layers(exp, steps)
     return Prepared(steps, layers, fingerprint(exp.image, layers))
 
