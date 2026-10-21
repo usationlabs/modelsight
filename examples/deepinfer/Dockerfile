@@ -47,6 +47,17 @@ RUN git init -q /opt/DeepInfer \
 WORKDIR /opt/DeepInfer
 # Slow dependency layer first; build.sh then builds the vendored kernels.
 RUN pip install -r requirements-nvidia.txt
+
+# DeepSelect's and FlashMLA's setup.py detect the platform by running `lspci`
+# as soon as they are imported, and fail if it is missing or exits non-zero.
+# A build machine has no GPU, so it reports CPU_ONLY and the explicit CUDA
+# target that DeepInfer's build_vendor.sh passes takes over. The wrapper keeps
+# lspci from failing where /sys/bus/pci is unavailable (sandboxed builders).
+# It sits after the dependency layer so changing it does not redo that layer.
+RUN apt-get update && apt-get install -y --no-install-recommends pciutils \
+    && rm -rf /var/lib/apt/lists/* \
+    && printf '#!/bin/sh\n/usr/bin/lspci "$@" 2>/dev/null\nexit 0\n' > /usr/local/bin/lspci \
+    && chmod +x /usr/local/bin/lspci
 RUN ./build.sh
 
 # --- Dynamo's Python bindings (Rust) ----------------------------------------
