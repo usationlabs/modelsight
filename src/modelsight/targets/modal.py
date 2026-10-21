@@ -9,6 +9,10 @@ a Dockerfile (or registry image) is the base, and ms adds its own layers on top.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 import modal
@@ -16,6 +20,7 @@ import modal
 from modelsight.build import BuildError, Prepared, prepare
 from modelsight.config import Experiment
 from modelsight.runner import MODAL_TIMEOUT_BUFFER_SECONDS, RunError
+from modelsight.runs import RunState, save_state
 
 VOLUME_NAME = "modelsight-results"
 RESULTS_MOUNT = "/results"
@@ -58,6 +63,63 @@ def build_image(exp: Experiment, prepared: Prepared) -> modal.Image:
             image = image.run_commands(layer.command)
     # Mounted at runtime, so changing ms does not rebuild the engine image.
     return image.add_local_python_source("modelsight")
+
+
+class LostConnection(RunError):
+    """This machine lost its connection to Modal. A detached run keeps going."""
+
+
+def _lost_connection(exc: BaseException) -> bool:
+    """True for a failure to reach Modal, as opposed to the remote code failing."""
+    lost = (
+        modal.exception.ConnectionError,
+        modal.exception.TimeoutError,
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    )
+    return isinstance(exc, lost)
+
+
+def active_profile() -> str | None:
+    return getattr(modal.config, "_profile", None) or os.environ.get("MODAL_PROFILE") or None
+
+
+def _absolute_output(exp: Experiment) -> str:
+    path = Path(exp.output)
+    return str(path if path.is_absolute() else Path.cwd() / path)
+
+
+def _record(kind: str, name: str, app, call, exp: Experiment, volume: str | None) -> RunState:
+    """Save what `ms attach` needs and tell the user how to reach the run."""
+    state = RunState(
+        kind=kind,
+        name=name,
+        app_id=app.app_id,
+        function_call_id=call.object_id,
+        profile=active_profile(),
+        output=_absolute_output(exp),
+        volume=volume,
+        started_at=datetime.now().isoformat(timespec="seconds"),
+    )
+    path = save_state(state)
+    print(
+        f"running detached (app {state.app_id}). Reconnect from this directory with: "
+        f"ms attach {name}\nstate saved in {path}\nstop it with: modal app stop {state.app_id}",
+        flush=True,
+    )
+    return state
+
+
+def _reattach_message(state: RunState) -> str:
+    return (
+        "lost the connection to Modal. The run is detached, so it keeps going there. "
+        f"Reconnect with: ms attach {state.name}"
+    )
+
+
+def _stamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 def _prepared(exp: Experiment, prepared: Prepared | None) -> Prepared:
@@ -112,16 +174,22 @@ def build(
         if cache_volume is not None:
             cache_volume.commit()
 
+    state = None
     try:
         with modal.enable_output(), app.run(detach=detach):
             if detach:
-                print(
-                    "running detached: it keeps going if this machine loses its "
-                    f"connection. Stop it with: modal app stop {app.app_id}",
-                    flush=True,
+                call = prepare_remote.spawn(models)
+                state = _record(
+                    "build", f"build-{prepared.fingerprint}-{_stamp()}", app, call, exp, None
                 )
-            prepare_remote.remote(models)
+                call.get()
+            else:
+                prepare_remote.remote(models)
+    except LostConnection:
+        raise
     except Exception as exc:
+        if state is not None and _lost_connection(exc):
+            raise LostConnection(_reattach_message(state)) from exc
         raise RunError(f"modal build failed: {exc}") from exc
     print(f"image {prepared.fingerprint} is built and cached", flush=True)
 
@@ -145,9 +213,9 @@ def run(
     )
     if detach:
         print(
-            "running detached: the container keeps going if this machine loses its "
-            "connection to Modal, and still stops at timeout. Results are stored on "
-            f"the volume; retrieve them with: modal volume get {VOLUME_NAME} {run_name} {local_dir}",
+            "detached: the container keeps going if this machine loses its connection "
+            "to Modal, and still stops at timeout. Results are stored on the volume "
+            f"(or fetch them by hand: modal volume get {VOLUME_NAME} {run_name} {local_dir}).",
             flush=True,
         )
     else:
@@ -201,15 +269,24 @@ def run(
                 except Exception as exc:
                     print(f"warning: could not commit a volume: {exc}", flush=True)
 
+    state = None
     try:
         with modal.enable_output(), app.run(detach=detach):
             if detach:
-                print(f"stop it with: modal app stop {app.app_id}", flush=True)
-            remote.remote(exp.to_mapping(), config_text, run_name, info_text)
+                call = remote.spawn(exp.to_mapping(), config_text, run_name, info_text)
+                state = _record("run", run_name, app, call, exp, VOLUME_NAME)
+                call.get()
+            else:
+                remote.remote(exp.to_mapping(), config_text, run_name, info_text)
+    except LostConnection:
+        raise
     except RunError:
         _download(volume, run_name, local_dir)
         raise
     except Exception as exc:
+        if state is not None and _lost_connection(exc):
+            # Offline, so there is nothing to download; the run is still going.
+            raise LostConnection(_reattach_message(state)) from exc
         _download(volume, run_name, local_dir)
         if "Secret" in type(exc).__name__ or HF_SECRET in str(exc):
             raise RunError(
@@ -223,6 +300,81 @@ def run(
             f"the Modal run finished, but no results were found on volume {VOLUME_NAME} at {run_name}"
         )
     return local_dir
+
+
+def attach(state: RunState, logs: bool = True) -> Path | None:
+    """Reconnect to a detached run: stream its logs, wait for it, fetch results.
+
+    Returns the folder results were copied to, or None for a build.
+    """
+    current = active_profile()
+    if state.profile and current != state.profile:
+        raise RunError(
+            f"this run started under Modal profile {state.profile!r} but {current!r} is "
+            f"active. Use: MODAL_PROFILE={state.profile} ms attach {state.name}"
+        )
+    call = modal.FunctionCall.from_id(state.function_call_id)
+    log_process = _follow_logs(state) if logs else None
+    finished = False
+    try:
+        call.get()
+        finished = True
+    except KeyboardInterrupt:
+        print(
+            f"\nstopped watching; the run is still going. Reconnect with: ms attach {state.name}",
+            flush=True,
+        )
+        raise
+    except (modal.exception.OutputExpiredError, modal.exception.NotFoundError):
+        print(
+            "Modal no longer has this call's result; looking for results on the volume.",
+            flush=True,
+        )
+        finished = True
+    except Exception as exc:
+        if _lost_connection(exc):
+            raise LostConnection(_reattach_message(state)) from exc
+        raise RunError(f"the {state.kind} failed: {exc}") from exc
+    finally:
+        _stop_logs(log_process, flush=finished)
+    print(f"the {state.kind} has finished", flush=True)
+    if state.kind != "run":
+        return None
+
+    volume = modal.Volume.from_name(state.volume or VOLUME_NAME)
+    local_dir = _local_destination(state.output, state.name)
+    if not _download(volume, state.name, local_dir):
+        raise RunError(
+            f"the run finished, but no results were found on volume {state.volume} at {state.name}"
+        )
+    return local_dir
+
+
+def _follow_logs(state: RunState) -> subprocess.Popen | None:
+    """Stream the app's logs to this terminal with Modal's own CLI."""
+    env = {**os.environ}
+    if state.profile:
+        env["MODAL_PROFILE"] = state.profile
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-m", "modal", "app", "logs", "-f", state.app_id], env=env
+        )
+    except OSError as exc:
+        print(f"could not stream logs: {exc}", flush=True)
+        return None
+
+
+def _stop_logs(process: subprocess.Popen | None, flush: bool) -> None:
+    if process is None:
+        return
+    if flush and process.poll() is None:
+        time.sleep(2)  # let the last lines arrive
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
 
 
 def _local_destination(output: str, run_name: str) -> Path:
