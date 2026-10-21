@@ -97,6 +97,28 @@ uv run ms run -f exp.yaml --dry-run   # shows the Dockerfile, resolved SHAs and 
 
 **Secrets.** Only variable names appear in logs and files. `ms` stops before launching if a named variable is unset.
 
+## Detached runs and reconnecting (Modal)
+
+Modal stops an app when the machine that started it loses its connection, so a long run is exposed to a laptop going offline. A detached run is not:
+
+```bash
+uv run ms run -f exp.yaml --detach     # the container keeps going if this machine disconnects
+uv run ms build -f exp.yaml            # builds are detached by default; --no-detach to opt out
+```
+
+When it starts, `ms` saves the run's app and call IDs in `.ms/runs/<name>.json` in the directory you ran it from. If the connection drops, `ms` says so and exits; the run continues on Modal. To pick it up again:
+
+```bash
+uv run ms attach                       # list the detached runs started from this directory
+uv run ms attach <name>                # stream logs, wait for it to finish, copy the results back
+uv run ms attach <name> --no-logs      # wait without streaming
+```
+
+- `attach` works for runs and builds, and for runs that have already finished (it replays the logs and fetches the results).
+- It needs the Modal profile (workspace) the run started under. If another is active it tells you the `MODAL_PROFILE=... ms attach ...` to use.
+- Ctrl-C while attached only stops watching; it never stops the run. Stop a detached run with `modal app stop <app id>`, which `ms` prints when it starts.
+- A run that is not detached and loses its connection is stopped by Modal and cannot be reattached.
+
 ## What a run does
 
 1. Start the `server` command, locally or inside a Modal container.
