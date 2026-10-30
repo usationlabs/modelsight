@@ -25,6 +25,9 @@ _POLL_SECONDS = 1
 # that hits the cap can still stop the server and flush results before Modal
 # kills the container.
 MODAL_TIMEOUT_BUFFER_SECONDS = 120
+# A volume commit that takes longer than this is abandoned, so a slow one cannot
+# hold a GPU container idle after the run is over.
+COMMIT_TIMEOUT_SECONDS = 180
 
 
 class RunError(Exception):
@@ -44,12 +47,20 @@ def allocate_run_dir(output: str, run_name: str) -> Path:
     return run_dir
 
 
-def execute_run(exp: Experiment, run_dir: Path, config_text: str) -> None:
-    """Run one experiment inside `run_dir`. Used on this machine and inside Modal."""
+def execute_run(
+    exp: Experiment, run_dir: Path, config_text: str, extra_env: str = ""
+) -> None:
+    """Run one experiment inside `run_dir`. Used on this machine and inside Modal.
+
+    `extra_env` is extra text for env.txt, such as what the Modal image was
+    built from.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "exp.yaml").write_text(config_text)
     (run_dir / "commands.txt").write_text(f"server: {exp.server}\nbench: {exp.bench}\n")
-    (run_dir / "env.txt").write_text(environment_report(exp.image))
+    (run_dir / "env.txt").write_text(
+        environment_report(exp.image) + extra_env + report_section(exp.report)
+    )
 
     deadline = time.monotonic() + exp.timeout_seconds
     server, server_log = start_process(
@@ -84,6 +95,40 @@ def execute_run(exp: Experiment, run_dir: Path, config_text: str) -> None:
         server_log.close()
 
 
+def commit_with_timeout(label: str, volume, timeout: float = COMMIT_TIMEOUT_SECONDS) -> bool:
+    """Commit a Modal volume, but give up waiting after `timeout` seconds.
+
+    Prints how long it took, so a slow commit is visible in the run's log.
+    Returns True only if the commit finished cleanly.
+    """
+    outcome: list[BaseException | None] = []
+
+    def work() -> None:
+        try:
+            volume.commit()
+            outcome.append(None)
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            outcome.append(exc)
+
+    started = time.monotonic()
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    took = time.monotonic() - started
+    if thread.is_alive():
+        print(
+            f"warning: committing the {label} volume is still running after {timeout:g}s; "
+            "not waiting any longer",
+            flush=True,
+        )
+        return False
+    if outcome and outcome[0] is not None:
+        print(f"warning: could not commit the {label} volume: {outcome[0]}", flush=True)
+        return False
+    print(f"committed the {label} volume in {took:.1f}s", flush=True)
+    return True
+
+
 def aiperf_status(exp: Experiment) -> str:
     """Where `aiperf` will come from, or why it will not be found."""
     try:
@@ -108,6 +153,32 @@ def environment_report(image: str | None) -> str:
         "nvidia-smi:",
         nvidia_smi(),
     ]
+    return "\n".join(lines) + "\n"
+
+
+def report_section(commands: tuple[str, ...], timeout: float = 60) -> str:
+    """Output of the experiment's `report` commands, for env.txt."""
+    if not commands:
+        return ""
+    lines = ["report:"]
+    for command in commands:
+        lines.append(f"$ {command}")
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            text = (result.stdout + result.stderr).strip()
+            if result.returncode != 0:
+                text = f"{text}\n(exit status {result.returncode})".strip()
+        except subprocess.TimeoutExpired:
+            text = f"(timed out after {timeout:g}s)"
+        lines.append(text or "(no output)")
     return "\n".join(lines) + "\n"
 
 

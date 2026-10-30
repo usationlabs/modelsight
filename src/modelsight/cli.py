@@ -9,8 +9,11 @@ from pathlib import Path
 import typer
 
 from modelsight import __version__
+from modelsight import build as image_plan
+from modelsight.build import BuildError, Prepared
 from modelsight.config import ConfigError, Experiment, load_experiment
 from modelsight.runner import RunError, aiperf_status
+from modelsight.runs import StateError, list_states, load_state
 from modelsight.targets import local, modal
 
 app = typer.Typer(
@@ -70,6 +73,14 @@ def run(
         "--dry-run",
         help="Print what would run, without launching anything.",
     ),
+    detach: bool = typer.Option(
+        False,
+        "--detach",
+        help=(
+            "Modal only: keep the run going if this machine loses its connection. "
+            "Ctrl-C then no longer stops it; use `modal app stop`."
+        ),
+    ),
 ) -> None:
     """Start the server, wait until it responds, run the bench, save results, stop."""
     try:
@@ -78,29 +89,68 @@ def run(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1) from exc
 
+    if detach and experiment.target != "modal":
+        typer.echo("error: --detach only applies to target: modal", err=True)
+        raise typer.Exit(1)
     name = run_name_for(config)
+    prepared = _prepare(experiment)
     if dry_run:
-        typer.echo(dry_run_report(experiment, config, name))
+        typer.echo(dry_run_report(experiment, config, name, prepared))
         return
 
     aiperf = aiperf_status(experiment)
     if aiperf.startswith("not found"):
         typer.echo(f"error: aiperf {aiperf}", err=True)
         raise typer.Exit(1)
+    _require_env(experiment, prepared)
 
-    target = local if experiment.target == "local" else modal
     try:
-        run_dir = target.run(experiment, config_text, name)
+        if prepared is None:
+            run_dir = local.run(experiment, config_text, name)
+        else:
+            run_dir = modal.run(experiment, config_text, name, prepared, detach=detach)
     except RunError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1) from exc
     except KeyboardInterrupt:
-        typer.echo("interrupted; server was shut down", err=True)
+        if detach:
+            typer.echo(
+                f"interrupted; the run is still going on Modal. Reconnect with: ms attach {name}",
+                err=True,
+            )
+        else:
+            typer.echo("interrupted; server was shut down", err=True)
         raise typer.Exit(130) from None
     typer.echo(f"results: {run_dir}")
 
 
-def dry_run_report(exp: Experiment, config: Path, name: str) -> str:
+def _prepare(exp: Experiment) -> Prepared | None:
+    """Plan the Modal image, resolving git refs. None for a local run."""
+    if exp.target != "modal":
+        return None
+    try:
+        return image_plan.prepare(exp)
+    except BuildError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+
+def _require_env(exp: Experiment, prepared: Prepared | None) -> None:
+    if prepared is None:
+        return
+    missing = image_plan.missing_env(exp)
+    if missing:
+        typer.echo(
+            "error: these environment variables are needed but not set "
+            f"(export them or put them in .env): {', '.join(missing)}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+
+def dry_run_report(
+    exp: Experiment, config: Path, name: str, prepared: Prepared | None = None
+) -> str:
     output = Path(exp.output)
     if not output.is_absolute():
         output = Path.cwd() / output
@@ -118,10 +168,128 @@ def dry_run_report(exp: Experiment, config: Path, name: str) -> str:
         f"bench: {exp.bench}",
         f"aiperf: {aiperf_status(exp)}",
     ]
+    if prepared is not None:
+        lines.extend(_image_lines(exp, prepared))
     return "\n".join(lines)
+
+
+def _image_lines(exp: Experiment, prepared: Prepared) -> list[str]:
+    lines = [f"image_fingerprint: {prepared.fingerprint}"]
+    if exp.dockerfile:
+        lines.append(f"dockerfile: {exp.dockerfile}")
+    for source in prepared.sources:
+        lines.append(f"source {source.name}: {source.repo} {source.ref} -> {source.sha}")
+    for name, value in exp.build_args:
+        lines.append(f"build_arg: {name}={value}")
+    if exp.cache:
+        models = ", ".join(exp.cache.prefetch) or "-"
+        lines.append(
+            f"cache: volume={exp.cache.volume} mount={exp.cache.mount} prefetch={models}"
+        )
+    if exp.secrets:
+        missing = set(image_plan.missing_env(exp))
+        shown = ", ".join(
+            f"{name} ({'missing' if name in missing else 'set'})" for name in exp.secrets
+        )
+        lines.append(f"secrets: {shown}")
+    if exp.report:
+        lines.append(f"report: {len(exp.report)} commands")
+    return lines
+
+
+@app.command()
+def build(
+    config: Path = typer.Option(
+        ...,
+        "--config",
+        "-f",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="Experiment YAML file.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the image plan and resolved refs, without building anything.",
+    ),
+    detach: bool = typer.Option(
+        True,
+        "--detach/--no-detach",
+        help=(
+            "Keep building and downloading if this machine loses its connection "
+            "(default). Ctrl-C then does not stop it; use `modal app stop`."
+        ),
+    ),
+) -> None:
+    """Build the Modal image and download cache.prefetch models, without a GPU."""
+    try:
+        experiment, _ = load_experiment(config)
+    except ConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    if experiment.target != "modal":
+        typer.echo("error: ms build only applies to target: modal", err=True)
+        raise typer.Exit(1)
+    if not experiment.dockerfile and not (experiment.cache and experiment.cache.prefetch):
+        typer.echo(
+            "error: nothing to build; add a dockerfile or cache.prefetch", err=True
+        )
+        raise typer.Exit(1)
+
+    prepared = _prepare(experiment)
+    assert prepared is not None
+    if dry_run:
+        typer.echo(dry_run_report(experiment, config, run_name_for(config), prepared))
+        return
+    _require_env(experiment, prepared)
+    try:
+        modal.build(experiment, prepared, detach=detach)
+    except RunError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    except KeyboardInterrupt:
+        typer.echo("interrupted", err=True)
+        raise typer.Exit(130) from None
 
 
 @app.command()
 def version() -> None:
     """Print the modelsight version."""
     typer.echo(__version__)
+
+
+@app.command()
+def attach(
+    run: str = typer.Argument(
+        None,
+        help="Run name (or saved state file). Omit it to list the runs started from this directory.",
+    ),
+    logs: bool = typer.Option(
+        True, "--logs/--no-logs", help="Stream the run's logs while waiting."
+    ),
+) -> None:
+    """Reconnect to a detached Modal run or build: stream logs, wait, fetch results."""
+    if run is None:
+        states = list_states()
+        if not states:
+            typer.echo("no detached runs saved here (they are kept in .ms/runs/)")
+            return
+        for state in states:
+            typer.echo(f"{state.name}  {state.kind}  app {state.app_id}  started {state.started_at}")
+        return
+    try:
+        state = load_state(run)
+    except StateError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    try:
+        results = modal.attach(state, logs=logs)
+    except RunError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    if results is not None:
+        typer.echo(f"results: {results}")

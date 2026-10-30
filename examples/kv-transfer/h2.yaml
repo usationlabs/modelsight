@@ -1,0 +1,67 @@
+# H2: can B still fetch KV blocks quickly while A is busy computing something else?
+#
+# This starts the same two vLLM servers as h1.yaml, on two A100-80GB GPUs. For each
+# prefix P1 from 8,000 to 128,000 tokens, A first computes P1 and hands back the
+# blocks' location. A then starts a fixed 64,000-token prompt, P2, and once P2 is
+# running the run measures time to first token for:
+#
+#   recompute   B computes P1 itself
+#   fetch_idle  B reads P1's blocks from A with no P2, as a baseline
+#   fetch_busy  B reads P1's blocks from A while A computes P2
+#   wait        P1 goes back to A while A computes P2
+#
+# The run reports each arm's latency and how long busy transfers took. Results land
+# in the run folder, as with h1.yaml. A only holds the blocks because the prefill
+# asked it to, so this does not cover prefixes cached long ago.
+#
+# Prepare once, with no GPU:  uv run ms build -f examples/kv-transfer/h2.yaml
+# Run, with streamed logs:    uv run ms run -f examples/kv-transfer/h2.yaml --detach
+target: modal
+gpu: A100-80GB:2
+dockerfile: Dockerfile
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [Qwen/Qwen3.8-27B]
+
+ready_url: http://localhost:8200/health
+ready_timeout: 15m
+timeout: 90m
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch) '
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - nvidia-smi nvlink --status
+
+# Each server's lines are tagged [A] or [B]. UCX's protocol tables are saved to
+# /tmp and left out of the stream. The run stops if either server exits.
+server: |
+  bash <<'EOF'
+  export PYTHONPATH=/opt/nixl-error-mode
+  export UCX_RCACHE_MAX_UNRELEASED=1024 UCX_PROTO_INFO=y
+  # NixlConnector refuses hybrid models like Qwen3.8 without this layout.
+  export VLLM_SSM_CONV_STATE_LAYOUT=DS
+
+  serve() {
+    # stdbuf: UCX's tables otherwise sit in a buffer and miss the probe's check.
+    CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL vllm serve Qwen/Qwen3.8-27B \
+      --port $3 \
+      --max-model-len 129024 \
+      --gpu-memory-utilization 0.92 \
+      --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"$5\",\"kv_load_failure_policy\":\"fail\"}" \
+      2>&1 | tee /tmp/server-$1.log | grep --line-buffered -v -E '^\[[0-9.]+\] +\[[^]]+\] +[|+]' | sed -u "s/^/[$1] /"
+  }
+
+  serve A 0 8100 5600 kv_producer &
+  serve B 1 8200 5601 kv_consumer &
+  wait -n
+  EOF
+
+# The container mounts modelsight at /root/modelsight.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_busy
+  --model Qwen/Qwen3.8-27B
+  --producer http://localhost:8100
+  --consumer http://localhost:8200
+  --producer-log /tmp/server-A.log
+  --consumer-log /tmp/server-B.log

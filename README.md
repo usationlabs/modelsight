@@ -59,6 +59,66 @@ Durations accept forms like `90s`, `20m`, `2h` and `1h30m`.
 
 **Request count.** AIPerf sends only 10 requests unless you set `--request-count`. That is fine for a smoke test, but with a concurrency above 10 the configured concurrency is never reached. Set it (a common rule of thumb is about 10x the concurrency) when you want numbers to compare.
 
+## Building your own image (Modal)
+
+When the engine is not in a ready-made image, for example a CUDA base with an engine built from source, point the experiment at a Dockerfile instead of `image`. Everything below applies to `target: modal` only. A full example lives in [`examples/kv-transfer/`](examples/kv-transfer/).
+
+```yaml
+dockerfile: Dockerfile          # relative to this file; use this or `image`, not both
+secrets: [HF_TOKEN]             # local variables forwarded to the container
+cache:
+  prefetch: [org/model]         # downloaded once, on a CPU container
+sources:                        # git repos whose ref is resolved to a commit SHA
+  ENGINE:
+    repo: https://github.com/org/engine
+    ref: my-branch              # branch, tag or full SHA; default: main
+report:
+  - git -C /opt/engine rev-parse HEAD
+```
+
+| Field | Meaning |
+| --- | --- |
+| `dockerfile` | Path to a Dockerfile, relative to the experiment file. The build context is its directory. |
+| `build_args` | Plain `ARG` values passed to the Dockerfile. |
+| `sources` | Named public `https://` repos. Each ref is resolved with `git ls-remote` before anything launches and passed as build args `<NAME>_REPO`, `<NAME>_REF` and `<NAME>_SHA`. The Dockerfile declares `ARG ENGINE_REPO` and `ARG ENGINE_SHA` and fetches that commit. |
+| `add_python` | Ask Modal to add this Python version if the image has none on `PATH`. |
+| `cache.prefetch` | Models downloaded to the cache volume by `ms build`, before any GPU is billed. |
+| `cache.volume`, `cache.mount` | Modal volume name (default `modelsight-cache`) and where it is mounted (default `/cache`). `HF_HOME` points inside it. |
+| `secrets` | Names of local environment variables (or `.env` entries) forwarded to the run. Without this field, the named Modal secret `huggingface` is used as before. |
+| `report` | Commands run in the container whose output is appended to `env.txt`, for example the revisions under test. |
+
+```bash
+uv run ms build -f exp.yaml     # build the image and prefetch models, no GPU
+uv run ms run -f exp.yaml       # reuses the cached image
+uv run ms run -f exp.yaml --dry-run   # shows the Dockerfile, resolved SHAs and fingerprint
+```
+
+**Caching.** Modal caches each layer by its content, and a changed layer rebuilds everything after it. Put slow, stable instructions first and the part you change often last. Because `sources` pass the commit SHA as a build arg, a branch that moved rebuilds only the layers from its `ARG` onward. `ms` appends its own layers (uv and AIPerf, then the cache env) after the Dockerfile's. The resolved SHAs and an image fingerprint are printed and saved in `env.txt`. The fingerprint covers the Dockerfile text, build args and `ms`'s layers, not files copied from the build context. Modal does not give images names, so "built" means the layers are cached in your workspace.
+
+**Secrets.** Only variable names appear in logs and files. `ms` stops before launching if a named variable is unset.
+
+## Detached runs and reconnecting (Modal)
+
+Modal stops an app when the machine that started it loses its connection, so a long run is exposed to a laptop going offline. A detached run is not:
+
+```bash
+uv run ms run -f exp.yaml --detach     # the container keeps going if this machine disconnects
+uv run ms build -f exp.yaml            # builds are detached by default; --no-detach to opt out
+```
+
+When it starts, `ms` saves the run's app and call IDs in `.ms/runs/<name>.json` in the directory you ran it from. If the connection drops, `ms` says so and exits; the run continues on Modal. To pick it up again:
+
+```bash
+uv run ms attach                       # list the detached runs started from this directory
+uv run ms attach <name>                # stream logs, wait for it to finish, copy the results back
+uv run ms attach <name> --no-logs      # wait without streaming
+```
+
+- `attach` works for runs and builds, and for runs that have already finished (it replays the logs and fetches the results).
+- It needs the Modal profile (workspace) the run started under. If another is active it tells you the `MODAL_PROFILE=... ms attach ...` to use.
+- Ctrl-C while attached only stops watching; it never stops the run. Stop a detached run with `modal app stop <app id>`, which `ms` prints when it starts.
+- A run that is not detached and loses its connection is stopped by Modal and cannot be reattached.
+
 ## What a run does
 
 1. Start the `server` command, locally or inside a Modal container.
