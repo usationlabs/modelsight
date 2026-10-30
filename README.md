@@ -61,7 +61,7 @@ Durations accept forms like `90s`, `20m`, `2h` and `1h30m`.
 
 ## Building your own image (Modal)
 
-When the engine is not in a ready-made image, for example a CUDA base with an engine built from source, point the experiment at a Dockerfile instead of `image`. Everything below applies to `target: modal` only. A full example lives in [`examples/deepinfer/`](examples/deepinfer/).
+When the engine is not in a ready-made image, for example a CUDA base with an engine built from source, point the experiment at a Dockerfile instead of `image`. Everything below applies to `target: modal` only. A full example lives in [`examples/kv-transfer/`](examples/kv-transfer/).
 
 ```yaml
 dockerfile: Dockerfile          # relative to this file; use this or `image`, not both

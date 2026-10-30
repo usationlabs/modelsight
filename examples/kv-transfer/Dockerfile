@@ -1,5 +1,5 @@
-# vLLM with its pinned NIXL, plus the error mode NIXL needs on Modal. The base is
-# the DeepInfer example's, and its compiler is what Triton builds GPU kernels with.
+# vLLM with its pinned NIXL, plus the error mode NIXL needs on Modal. The base's
+# compiler is what Triton builds GPU kernels with.
 FROM nvidia/cuda:13.2.1-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive

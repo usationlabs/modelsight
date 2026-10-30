@@ -61,6 +61,6 @@ def test_h2_example_is_a_valid_experiment():
 
     experiment, _ = load_experiment(path)
 
-    assert experiment.timeout == "45m"
+    assert experiment.timeout == "90m"
     assert "--max-model-len 129024" in experiment.server
     assert "modelsight.probes.kv_busy" in experiment.bench
