@@ -1,6 +1,6 @@
 # modelsight (`ms`)
 
-A small tool for running reproducible inference-server benchmarks. A YAML file describes an experiment. `ms` runs it, either on a local GPU machine or on [Modal](https://modal.com), and saves the logs, the exact commands and the benchmark output in one folder. The examples use [SGLang](https://github.com/sgl-project/sglang) as the server and [AIPerf](https://github.com/ai-dynamo/aiperf) as the load generator.
+A small tool for running reproducible inference-server benchmarks. A YAML file describes an experiment. `ms` runs it, either on a local GPU machine or on [Modal](https://modal.com), and saves the logs, the exact commands and the benchmark output in one folder.
 
 It is a thin wrapper, not a benchmarking framework. `server` and `bench` are plain command strings, copied straight from the engine's and the benchmark tool's docs. `ms` never parses or validates their flags, and it only needs the server to answer on `ready_url`, so another engine such as vLLM should work by changing `image`, `server` and `ready_url`. Only SGLang has been tried so far.
 
