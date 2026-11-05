@@ -1,0 +1,71 @@
+# H3: how long a remnant can a busy producer recompute before it hurts?
+#
+# A router that moves a request off a busy A to B, using A's cached prefix,
+# asks A to export that prefix. If A has lost part of it, A recomputes the
+# remnant while it serves its own users. This finds where that starts to matter.
+#
+# It starts two vLLM servers in one Modal container, A on GPU 0 and B on GPU 1,
+# connected by NixlConnector over NVLink, running Qwen3-8B on two A100-80GB
+# GPUs. A gets a steady decode-heavy background load at several concurrencies.
+# At each load, A computes remnants from 1,000 to 32,000 tokens for B, and the
+# run records:
+#
+#   router  the flow (prepare on A, pull on B, serve on B) against B
+#           recomputing the remnant itself
+#   users   p95 time per output token of A's background requests during the
+#           prepare, against the same load just before it
+#
+# For each load it prints the shortest remnant where the flow is slower than
+# recomputing, and where A's users see p95 TPOT rise by more than 20%. A's
+# measured saturation (running requests, KV usage, decode tokens/s) is printed
+# for each load. Results land in the run folder: results.json, server.log,
+# bench.log, env.txt and the full server logs.
+#
+# Prepare once, with no GPU:  uv run ms build -f examples/kv-transfer/h3.yaml
+# Run, with streamed logs:    uv run ms run -f examples/kv-transfer/h3.yaml --detach
+target: modal
+gpu: A100-80GB:2
+dockerfile: Dockerfile
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [Qwen/Qwen3-8B]
+
+ready_url: http://localhost:8200/health
+ready_timeout: 15m
+timeout: 60m
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch) '
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - nvidia-smi nvlink --status
+
+# Each server's lines are tagged [A] or [B]. UCX's protocol tables are saved to
+# /tmp and left out of the stream. The run stops if either server exits.
+server: |
+  bash <<'EOF'
+  export PYTHONPATH=/opt/nixl-error-mode
+  export UCX_RCACHE_MAX_UNRELEASED=1024
+
+  serve() {
+    CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL vllm serve Qwen/Qwen3-8B \
+      --port $3 \
+      --max-model-len 33024 \
+      --gpu-memory-utilization 0.92 \
+      --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"$5\",\"kv_load_failure_policy\":\"fail\"}" \
+      2>&1 | tee /tmp/server-$1.log | grep --line-buffered -v -E '^\[[0-9.]+\] +\[[^]]+\] +[|+]' | sed -u "s/^/[$1] /"
+  }
+
+  serve A 0 8100 5600 kv_producer &
+  serve B 1 8200 5601 kv_consumer &
+  wait -n
+  EOF
+
+# The container mounts modelsight at /root/modelsight.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_saturation
+  --model Qwen/Qwen3-8B
+  --producer http://localhost:8100
+  --consumer http://localhost:8200
+  --producer-log /tmp/server-A.log
+  --consumer-log /tmp/server-B.log
