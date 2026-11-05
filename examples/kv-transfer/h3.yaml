@@ -1,0 +1,68 @@
+# H3: can stock vLLM reuse a peer's cached prefix without recomputing it?
+#
+# This starts two vLLM servers in one Modal container, A on GPU 0 and B on GPU 1,
+# connected by NixlConnector over NVLink. It runs Qwen3-8B, a pure attention
+# model, so that vLLM's hybrid-model paths are not part of the result. It
+# checks two limits of the three-request flow (prepare on A, pull on B, serve
+# on B) that a router would use to move a request off a busy A:
+#
+#   Problem 1  A computes the prefix it no longer has. Time to prepare on A, and
+#              the whole flow, are compared when A has all, half or none of the
+#              prefix cached, against B recomputing it.
+#   Problem 2  B can only pull blocks for its whole prompt. B is sent a longer
+#              prompt, and a shorter one, with A's blocks for the prefix, and its
+#              output is checked against A's.
+#
+# The run prints both verdicts. Results land in the run folder: results.json,
+# server.log, bench.log, env.txt and the full server logs.
+#
+# Prepare once, with no GPU:  uv run ms build -f examples/kv-transfer/h3.yaml
+# Run, with streamed logs:    uv run ms run -f examples/kv-transfer/h3.yaml --detach
+target: modal
+gpu: A100-80GB:2
+dockerfile: Dockerfile
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [Qwen/Qwen3-8B]
+
+ready_url: http://localhost:8200/health
+ready_timeout: 15m
+timeout: 45m
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch) '
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - nvidia-smi nvlink --status
+
+# Each server's lines are tagged [A] or [B]. UCX's protocol tables are saved to
+# /tmp and left out of the stream. If a server exits, the bench keeps going and
+# records the failed requests, which is itself a result for problem 2.
+server: |
+  bash <<'EOF'
+  export PYTHONPATH=/opt/nixl-error-mode
+  export UCX_RCACHE_MAX_UNRELEASED=1024
+
+  serve() {
+    CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL vllm serve Qwen/Qwen3-8B \
+      --port $3 \
+      --max-model-len 33024 \
+      --gpu-memory-utilization 0.92 \
+      --enable-prompt-tokens-details \
+      --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"$5\",\"kv_load_failure_policy\":\"fail\"}" \
+      2>&1 | tee /tmp/server-$1.log | grep --line-buffered -v -E '^\[[0-9.]+\] +\[[^]]+\] +[|+]' | sed -u "s/^/[$1] /"
+  }
+
+  serve A 0 8100 5600 kv_producer &
+  serve B 1 8200 5601 kv_consumer &
+  wait -n
+  EOF
+
+# The container mounts modelsight at /root/modelsight.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_peer_fetch
+  --model Qwen/Qwen3-8B
+  --producer http://localhost:8100
+  --consumer http://localhost:8200
+  --producer-log /tmp/server-A.log
+  --consumer-log /tmp/server-B.log
