@@ -233,8 +233,9 @@ def greedy(servers: Servers, url: str, body: dict) -> dict:
 def peer_params(producer: dict, hashes: list[str], identity: dict | None) -> dict:
     """kv_transfer_params for one request to B that asks A by block hash.
 
-    Field names follow the RFC's integration plan (one request to B, B calls
-    A on the NIXL side channel). Update here if the branch renames them.
+    One request to B, and B calls A on the NIXL side channel. B hashes the
+    prompt itself; the hashes are sent as a router would send them. A's
+    topology (tp, dcp, pp sizes) lets B heartbeat the pin and release it.
     """
     params = {
         "do_remote_prefill": True,
@@ -244,6 +245,9 @@ def peer_params(producer: dict, hashes: list[str], identity: dict | None) -> dic
         "remote_host": producer["remote_host"],
         "remote_port": producer["remote_port"],
     }
+    for key in ("tp_size", "dcp_size", "pp_size"):
+        if key in producer:
+            params[key] = producer[key]
     if identity:
         params["kv_identity"] = identity
     return params
