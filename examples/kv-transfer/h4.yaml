@@ -93,27 +93,8 @@ server: |
   # --no-enable-extensible-kv-cache: vLLM's extensible KV cache maps its memory
   # with CUDA VMM, which legacy CUDA IPC cannot export, so UCX reads it through
   # host shared memory (sysv, ~0.5 GB/s) instead of cuda_ipc (~190 GB/s here).
-  # B runs under py-spy, which samples every thread of B's processes 200 times a
-  # second, idle threads included, without pausing them. The bench stops it at
-  # the end so it writes pyspy-B.json (speedscope). If py-spy cannot sample in
-  # this container, B runs without it.
-  PYSPY_B=""
-  if py-spy record --idle --format speedscope -o /tmp/pyspy-check.json \
-       -- python -c 'import time; time.sleep(1)' >/dev/null 2>&1; then
-    cat > /tmp/pyspy-B <<'SH'
-  #!/bin/bash
-  echo $$ > /tmp/pyspy-B.pid
-  exec py-spy record --subprocesses --idle --threads --nonblocking --rate 200 \
-    --format speedscope -o /tmp/pyspy-B.json -- "$@"
-  SH
-    chmod +x /tmp/pyspy-B
-    PYSPY_B=/tmp/pyspy-B
-  else
-    echo "py-spy cannot sample here; B runs without it"
-  fi
-
   serve() {
-    CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL $5 vllm serve Qwen/Qwen3-8B \
+    CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL vllm serve Qwen/Qwen3-8B \
       --port $3 \
       --max-model-len 32768 \
       --gpu-memory-utilization 0.9 \
@@ -124,26 +105,18 @@ server: |
   }
 
   serve A 0 8100 5600 &
-  serve B 1 8200 5601 "$PYSPY_B" &
+  serve B 1 8200 5601 &
   wait -n
   EOF
 
-# The container mounts modelsight at /root/modelsight. After the probe, the bench
-# stops py-spy so it writes B's profile, and copies it next to results.json.
-bench: |
-  PYTHONPATH=/root python -m modelsight.probes.kv_peer_lookup \
-    --model Qwen/Qwen3-8B \
-    --producer http://localhost:8100 \
-    --consumer http://localhost:8200 \
-    --producer-log /tmp/server-A.log \
-    --consumer-log /tmp/server-B.log \
-    --mode peer \
-    --sessions 20 \
-    --max-prompt-tokens 30000
-  status=$?
-  if [ -s /tmp/pyspy-B.pid ] && kill -INT "$(cat /tmp/pyspy-B.pid)"; then
-    for i in $(seq 120); do [ -s /tmp/pyspy-B.json ] && break; sleep 1; done
-    sleep 2
-    cp /tmp/pyspy-B.json . || echo "py-spy wrote no profile"
-  fi
-  exit $status
+# The container mounts modelsight at /root/modelsight.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_peer_lookup
+  --model Qwen/Qwen3-8B
+  --producer http://localhost:8100
+  --consumer http://localhost:8200
+  --producer-log /tmp/server-A.log
+  --consumer-log /tmp/server-B.log
+  --mode peer
+  --sessions 20
+  --max-prompt-tokens 30000
