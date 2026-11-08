@@ -53,3 +53,10 @@ def test_gpu_link_example_is_a_valid_experiment():
 
     assert experiment.dockerfile.endswith("Dockerfile.h4")
     assert "nixl_bandwidth" in experiment.bench
+
+
+def test_report_shows_the_cold_read(capsys):
+    row = {"descriptors": 36, "bytes": 36_000_000, "gbps_median": 180.0,
+           "gbps_max": 190.0, "cold_seconds": 0.0123}  # fmt: skip
+    bw.print_report({"peer_copy": {"error": "none"}, **result([row])})
+    assert "12.3" in capsys.readouterr().out

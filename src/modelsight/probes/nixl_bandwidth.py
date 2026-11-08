@@ -161,9 +161,11 @@ def run_initiator(port: int, size: int, counts: list[int], repeats: int) -> int:
             moved = local[0][1] * count
             row: dict = {"descriptors": count, "bytes": moved}
             try:
-                times = [read_once(agent, local, remote, remote_name)
-                         for _ in range(repeats + 1)][1:]  # fmt: skip
-                row.update(seconds=times,
+                # The first read is kept apart: it is where UCX maps the
+                # remote cuda_ipc handles, a cost vLLM may pay on every pull.
+                cold, *times = [read_once(agent, local, remote, remote_name)
+                                for _ in range(repeats + 1)]  # fmt: skip
+                row.update(cold_seconds=cold, seconds=times,
                            gbps_median=gbps(moved, statistics.median(times)),
                            gbps_max=gbps(moved, min(times)))  # fmt: skip
             except (RuntimeError, TimeoutError) as exc:
@@ -256,14 +258,15 @@ def print_report(result: dict) -> None:
         print(f"peer_copy GPU0->GPU1  {copy['bytes'] / GIB:.1f} GiB  "
               f"median {copy['gbps_median']:.1f} GB/s  max {copy['gbps_max']:.1f} GB/s  "
               f"peer_access={copy['peer_access']}")  # fmt: skip
-    print("nixl_read  descriptors   MB/desc   median_GB/s   max_GB/s")
+    print("nixl_read  descriptors   MB/desc   median_GB/s   max_GB/s   cold_ms")
     for row in result["nixl_read"]["rows"]:
         per = row["bytes"] / row["descriptors"] / 1e6
         if "error" in row:
             print(f"           {row['descriptors']:>11}  {per:>8.2f}   {row['error']}")
         else:
             print(f"           {row['descriptors']:>11}  {per:>8.2f}   "
-                  f"{row['gbps_median']:>11.1f}   {row['gbps_max']:>8.1f}")  # fmt: skip
+                  f"{row['gbps_median']:>11.1f}   {row['gbps_max']:>8.1f}   "
+                  f"{row['cold_seconds'] * 1e3:>7.1f}")  # fmt: skip
     path = result["nixl_read"]["read_path"]
     print(
         "UCX read path:"

@@ -59,20 +59,25 @@ server: |
   export UCX_RCACHE_MAX_UNRELEASED=1024 UCX_PROTO_INFO=y
 
   # vLLM logs at INFO, but the peer lookup modules at DEBUG, so A's log shows
-  # each lookup ("lookup_pin") and B's shows each hit.
+  # each lookup ("lookup_pin") and B's shows each hit. The NIXL worker modules
+  # log at DEBUG too, with millisecond timestamps, so B's log shows when each
+  # pull starts (start_load_kv), how long a handshake takes, and when the
+  # worker reports it done (get_finished).
   cat > /tmp/vllm-logging.json <<'JSON'
   {
     "version": 1,
     "disable_existing_loggers": false,
     "formatters": {"vllm": {"()": "vllm.logging_utils.NewLineFormatter",
       "datefmt": "%m-%d %H:%M:%S",
-      "format": "(%(vllm_process_name)s pid=%(process)d) %(levelname)s %(asctime)s [%(fileinfo)s:%(lineno)d] %(message)s"}},
+      "format": "(%(vllm_process_name)s pid=%(process)d) %(levelname)s %(asctime)s.%(msecs)03d [%(fileinfo)s:%(lineno)d] %(message)s"}},
     "handlers": {"vllm": {"class": "logging.StreamHandler", "formatter": "vllm",
       "level": "DEBUG", "stream": "ext://sys.stdout"}},
     "loggers": {
       "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": false},
       "vllm.distributed.kv_transfer.kv_connector.v1.nixl.peer_pins": {"level": "DEBUG"},
-      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler": {"level": "DEBUG"}
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler": {"level": "DEBUG"},
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker": {"level": "DEBUG"},
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker": {"level": "DEBUG"}
     }
   }
   JSON
