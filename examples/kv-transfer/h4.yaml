@@ -83,12 +83,16 @@ server: |
   JSON
   export VLLM_LOGGING_CONFIG_PATH=/tmp/vllm-logging.json
 
+  # --no-enable-extensible-kv-cache: vLLM's extensible KV cache maps its memory
+  # with CUDA VMM, which legacy CUDA IPC cannot export, so UCX reads it through
+  # host shared memory (sysv, ~0.5 GB/s) instead of cuda_ipc (~190 GB/s here).
   serve() {
     CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL vllm serve Qwen/Qwen3-8B \
       --port $3 \
       --max-model-len 32768 \
       --gpu-memory-utilization 0.9 \
       --prefix-caching-hash-algo sha256 \
+      --no-enable-extensible-kv-cache \
       --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"peer_lookup":true}}' \
       2>&1 | tee /tmp/server-$1.log | sed -u "s/^/[$1] /"
   }
