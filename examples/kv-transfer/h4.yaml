@@ -62,7 +62,9 @@ server: |
   # each lookup ("lookup_pin") and B's shows each hit. The NIXL worker modules
   # log at DEBUG too, with millisecond timestamps, so B's log shows when each
   # pull starts (start_load_kv), how long a handshake takes, and when the
-  # worker reports it done (get_finished).
+  # worker reports it done (get_finished). The engine core and scheduler log at
+  # DEBUG too, so B's log shows when its engine goes idle ("EngineCore waiting
+  # for work") and when a request waits for remote KV.
   cat > /tmp/vllm-logging.json <<'JSON'
   {
     "version": 1,
@@ -77,7 +79,9 @@ server: |
       "vllm.distributed.kv_transfer.kv_connector.v1.nixl.peer_pins": {"level": "DEBUG"},
       "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler": {"level": "DEBUG"},
       "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker": {"level": "DEBUG"},
-      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker": {"level": "DEBUG"}
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker": {"level": "DEBUG"},
+      "vllm.v1.engine.core": {"level": "DEBUG"},
+      "vllm.v1.core.sched.scheduler": {"level": "DEBUG"}
     }
   }
   JSON
