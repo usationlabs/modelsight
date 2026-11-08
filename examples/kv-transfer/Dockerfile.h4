@@ -24,4 +24,7 @@ ARG VLLM_SHA
 RUN VLLM_USE_PRECOMPILED=1 uv pip install --python /opt/venv/bin/python \
         "vllm @ git+${VLLM_REPO}@${VLLM_SHA}"
 
+# py-spy samples B's engine, so its profile shows where a step blocks.
+RUN uv pip install --python /opt/venv/bin/python py-spy==0.4.0
+
 COPY sitecustomize.py /opt/nixl-error-mode/sitecustomize.py
