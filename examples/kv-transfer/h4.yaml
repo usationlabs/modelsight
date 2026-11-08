@@ -21,6 +21,8 @@
 #
 # A and B both start with peer_lookup on, so either can serve a lookup.
 #
+# Design, inputs and expected outcomes: examples/kv-transfer/h4.md
+#
 # Prepare once, with no GPU:  uv run ms build -f examples/kv-transfer/h4.yaml
 # Run, with streamed logs:    uv run ms run -f examples/kv-transfer/h4.yaml --detach
 target: modal
