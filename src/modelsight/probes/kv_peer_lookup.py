@@ -402,6 +402,29 @@ def latency(records: list[dict]) -> dict:
     return table
 
 
+def pull_rates(records: list[dict]) -> dict:
+    """Pull throughput per arm, from vLLM's NIXL metrics on B.
+
+    NIXL stops the transfer clock when B polls it, so this is a lower bound on
+    the link speed; compare it with probes.nixl_bandwidth.
+    """
+    table: dict = {}
+    for arm in ("stock", "peer"):
+        moved = [r[arm]["transfer"] for r in records
+                 if arm in r and r[arm]["transfer"].get("xfer_s", 0) > 0]  # fmt: skip
+        if moved:
+            table[arm] = {
+                "gbps_median": statistics.median(
+                    m["bytes"] / m["xfer_s"] / 1e9 for m in moved
+                ),
+                "descriptors_median": statistics.median(
+                    m["descriptors"] for m in moved
+                ),
+                "transfers": len(moved),
+            }
+    return table
+
+
 def print_summary(checks: dict, table: dict) -> None:
     print("case     recompute_s  stock_s  peer_s")
     for case, arms in table.items():
@@ -476,14 +499,27 @@ def main(argv: list[str] | None = None) -> int:
     leak_free = reset_cache(servers.producer)
     checks = check(good, args.mode, leak_free)
     table = latency(good)
+    rates = pull_rates(good)
+    path = (kv.read_path(args.consumer_log.read_text(errors="replace"))
+            if args.consumer_log.exists() else [])  # fmt: skip
     args.output.write_text(json.dumps(
         {"model": args.model, "mode": args.mode, "traces": args.traces,
-         "checks": checks, "latency": table, "records": records}, indent=2))  # fmt: skip
+         "checks": checks, "latency": table, "pull_rates": rates,
+         "read_path": path, "records": records}, indent=2))  # fmt: skip
     for log in (args.producer_log, args.consumer_log):
         if log.exists():
             shutil.copy(log, args.output.parent / log.name)
 
     print_summary(checks, table)
+    for arm, rate in rates.items():
+        print(
+            f"pull {arm}: median {rate['gbps_median']:.2f} GB/s over "
+            f"{rate['descriptors_median']:.0f} descriptors ({rate['transfers']} transfers)"
+        )
+    print(
+        "UCX read path:"
+        + ("".join(f"\n  {row}" for row in path) if path else " (not logged)")
+    )
     errors = len(records) - len(good)
     failed = [k for k, v in checks.items() if isinstance(v, dict) and v["ok"] is False]
     if errors or failed or not good:

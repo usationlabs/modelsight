@@ -305,3 +305,17 @@ def test_h4_example_is_a_valid_experiment():
     assert experiment.dockerfile.endswith("Dockerfile.h4")
     assert "kv_peer_lookup" in experiment.bench
     assert [s.name for s in experiment.sources] == ["VLLM"]
+
+
+def test_pull_rates_use_vllm_transfer_metrics():
+    records = [
+        {"peer": {"transfer": {"bytes": 4e9, "xfer_s": 2.0, "descriptors": 36}}},
+        {"peer": {"transfer": {"bytes": 2e9, "xfer_s": 2.0, "descriptors": 30}},
+         "stock": {"transfer": {"bytes": 1e9, "xfer_s": 0.0, "descriptors": 1}}},
+    ]  # fmt: skip
+
+    rates = h4.pull_rates(records)
+
+    assert rates == {
+        "peer": {"gbps_median": 1.5, "descriptors_median": 33, "transfers": 2}
+    }

@@ -45,6 +45,7 @@ report:
   - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch) '
   - pip show vllm 2>/dev/null | grep -i -E '^(version|location)'
   - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - nvidia-smi nvlink --status
 
 # Each server's lines are tagged [A] or [B]. Both run as kv_both so either can
 # pull, and VLLM_SERVER_DEV_MODE exposes /reset_prefix_cache, which the probe
@@ -53,7 +54,9 @@ server: |
   bash <<'EOF'
   export PYTHONPATH=/opt/nixl-error-mode
   export VLLM_SERVER_DEV_MODE=1
-  export UCX_RCACHE_MAX_UNRELEASED=1024
+  # UCX_PROTO_INFO prints the protocol UCX picks for each operation, so B's
+  # log shows the transport its KV reads take (cuda_ipc: GPU to GPU).
+  export UCX_RCACHE_MAX_UNRELEASED=1024 UCX_PROTO_INFO=y
 
   # vLLM logs at INFO, but the peer lookup modules at DEBUG, so A's log shows
   # each lookup ("lookup_pin") and B's shows each hit.
