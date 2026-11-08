@@ -40,9 +40,15 @@ report:
 # Nothing to serve; ms waits for a server, so give it one that answers at once.
 server: python3 -m http.server 8000 --bind 127.0.0.1
 
-# The container mounts modelsight at /root/modelsight.
+# The container mounts modelsight at /root/modelsight. The probe runs twice:
+# with NIXL's default of no UCX worker threads (results.json), then with the 4
+# that vLLM's NixlConnector uses (results-threads4.json). In H4, vLLM's reads
+# took "software emulation | sysv/memory" instead of cuda_ipc; the second run
+# shows whether the threads are why.
 bench: >-
   PYTHONPATH=/root python -m modelsight.probes.nixl_bandwidth
-  --size-gib 4
-  --descriptors 1,36,431,4096,16384
-  --repeats 5
+  --size-gib 4 --descriptors 1,36,431,4096,16384 --repeats 5
+  --num-threads 0 --output results.json;
+  PYTHONPATH=/root python -m modelsight.probes.nixl_bandwidth
+  --size-gib 4 --descriptors 1,36,431,4096,16384 --repeats 5
+  --num-threads 4 --port 5710 --output results-threads4.json

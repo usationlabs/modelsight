@@ -90,23 +90,30 @@ def peer_copy(size: int, repeats: int) -> dict:
     }
 
 
-def nixl_agent(name: str):
-    """A NIXL agent with only the UCX backend, in the error mode Modal needs."""
+def nixl_agent(name: str, num_threads: int = 0):
+    """A NIXL agent with only the UCX backend, in the error mode Modal needs.
+
+    vLLM's NixlConnector passes num_threads=4 (its default), which gives the
+    UCX backend several worker threads; 0 is NIXL's own default.
+    """
     from nixl._api import nixl_agent as agent_cls
     from nixl._api import nixl_agent_config
 
-    agent = agent_cls(name, nixl_agent_config(backends=[]))
+    agent = agent_cls(name, nixl_agent_config(backends=[], capture_telemetry=True))
     # NIXL's default "peer" mode needs tcp or RDMA, which UCX lacks on Modal.
-    agent.create_backend("UCX", {"ucx_error_handling_mode": "none"})
+    params = {"ucx_error_handling_mode": "none"}
+    if num_threads > 0:
+        params["num_threads"] = str(num_threads)
+    agent.create_backend("UCX", params)
     return agent
 
 
-def run_target(port: int, size: int) -> int:
+def run_target(port: int, size: int, num_threads: int = 0) -> int:
     """Hold a registered GPU buffer until the initiator is done with it."""
     import torch
 
     buf = torch.ones(size, dtype=torch.uint8, device="cuda:0")
-    agent = nixl_agent("target")
+    agent = nixl_agent("target", num_threads)
     agent.register_memory(agent.get_reg_descs([(buf.data_ptr(), size, 0, "")], "VRAM"))
     with Listener(("127.0.0.1", port), authkey=AUTH) as listener:
         print(f"target ready on port {port}", flush=True)
@@ -136,12 +143,14 @@ def read_once(agent, local: list, remote: list, remote_name: str) -> float:
     return elapsed
 
 
-def run_initiator(port: int, size: int, counts: list[int], repeats: int) -> int:
+def run_initiator(
+    port: int, size: int, counts: list[int], repeats: int, num_threads: int = 0
+) -> int:
     """READ the target's buffer at each descriptor count; one JSON line per row."""
     import torch
 
     buf = torch.zeros(size, dtype=torch.uint8, device="cuda:0")
-    agent = nixl_agent("initiator")
+    agent = nixl_agent("initiator", num_threads)
     agent.register_memory(agent.get_reg_descs([(buf.data_ptr(), size, 0, "")], "VRAM"))
     deadline = time.monotonic() + HANDSHAKE_TIMEOUT_SECONDS
     while True:
@@ -202,9 +211,11 @@ def nixl_read(
 ) -> dict:
     """Run target (GPU 0) and initiator (GPU 1) as separate processes."""
     base = [sys.executable, "-u", "-m", "modelsight.probes.nixl_bandwidth",
-            "--port", str(args.port), "--size-gib", str(args.size_gib)]  # fmt: skip
-    target_log = logdir / "nixl-target.log"
-    initiator_log = logdir / "nixl-initiator.log"
+            "--port", str(args.port), "--size-gib", str(args.size_gib),
+            "--num-threads", str(args.num_threads)]  # fmt: skip
+    suffix = f"-threads{args.num_threads}" if args.num_threads else ""
+    target_log = logdir / f"nixl-target{suffix}.log"
+    initiator_log = logdir / f"nixl-initiator{suffix}.log"
     with target_log.open("w") as tout, initiator_log.open("w") as iout:
         target = subprocess.Popen(base + ["--role", "target"], env=role_env(0),
                                   stdout=tout, stderr=subprocess.STDOUT)  # fmt: skip
@@ -280,6 +291,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--descriptors", default=DEFAULT_DESCRIPTORS)
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
     parser.add_argument("--port", type=int, default=5700)
+    parser.add_argument("--num-threads", type=int, default=0,
+                        help="UCX backend worker threads; vLLM uses 4")  # fmt: skip
     parser.add_argument("--timeout", type=float, default=15 * 60)
     parser.add_argument("--output", type=Path, default=Path("results.json"))
     parser.add_argument(
@@ -293,13 +306,14 @@ def main(argv: list[str] | None = None) -> int:
     size = int(args.size_gib * GIB)
     counts = [int(c) for c in args.descriptors.split(",")]
     if args.role == "target":
-        return run_target(args.port, size)
+        return run_target(args.port, size, args.num_threads)
     if args.role == "initiator":
-        return run_initiator(args.port, size, counts, args.repeats)
+        return run_initiator(args.port, size, counts, args.repeats, args.num_threads)
 
     logdir = args.output.parent
     result = {
         "size_bytes": size,
+        "num_threads": args.num_threads,
         "nvlink_status": shell("nvidia-smi nvlink --status"),
         "ucx_transports": shell("ucx_info -d | grep -E 'Transport|Device'"),
         "peer_copy": peer_copy(size, args.repeats),
