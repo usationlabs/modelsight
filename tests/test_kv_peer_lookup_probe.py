@@ -89,7 +89,7 @@ class FakeVllm:
             )
             with producer.log.open("a") as f:
                 f.write(
-                    f"INFO handled LOOKUP_PIN_MSG for {len(params['remote_block_hashes'])}\n"
+                    "INFO handled LOOKUP_PIN_MSG\n"
                 )
             if producer.serve_peer:
                 producer.served += 1
@@ -151,9 +151,6 @@ def fakes(tmp_path, monkeypatch):
     monkeypatch.setattr(kv_transfer, "METRICS_WAIT_SECONDS", 0.05)
     monkeypatch.setattr(h4, "RESET_ATTEMPTS", 1)
     monkeypatch.setattr(h4, "chat_renderer", lambda model: render)
-    monkeypatch.setattr(
-        h4, "block_hashes", lambda p, bs, algo: [str(i) for i in range(len(p) // bs)]
-    )
     producer = FakeVllm(tmp_path / "server-A.log")
     consumer = FakeVllm(tmp_path / "server-B.log", producer)
     producer.log.write_text("")
@@ -198,7 +195,7 @@ def test_peer_mode_passes_every_check(fakes, tmp_path):
     assert (tmp_path / "out" / "server-A.log").exists()
 
 
-def test_peer_request_sends_block_hashes_and_producer_address(fakes, tmp_path):
+def test_peer_request_sends_producer_address_and_no_hashes(fakes, tmp_path):
     (tmp_path / "out").mkdir()
     _, consumer = fakes
 
@@ -208,7 +205,7 @@ def test_peer_request_sends_block_hashes_and_producer_address(fakes, tmp_path):
             if (r.get("kv_transfer_params") or {}).get("peer_lookup")]  # fmt: skip
     assert len(peer) == len(h4.CASES)
     assert peer[0]["remote_engine_id"] == "a" and peer[0]["remote_port"] == 1
-    assert peer[0]["remote_block_hashes"]
+    assert "remote_block_hashes" not in peer[0]
 
 
 def test_consumer_pulls_the_address_prefill_first(fakes, tmp_path):

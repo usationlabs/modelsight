@@ -12,8 +12,8 @@ Cases, each on a fresh pair of prefix caches:
 
 Arms per case:
 
-  peer       one request to B with the prompt's block hashes; B asks A, A pins
-             what it holds and B pulls it (needs the branch; --mode peer)
+  peer       one request to B with peer_lookup and A's address; B hashes the
+             prompt, asks A, A pins what it holds and B pulls it (needs the branch; --mode peer)
   stock      today's flow: A prefills, B pulls, B serves
   recompute  B computes the prompt itself
 
@@ -153,29 +153,6 @@ def chat_renderer(model: str) -> Callable[[list[dict]], list[int]]:
     return render
 
 
-# Block hashes, as vLLM computes them ---------------------------------------
-
-
-def block_hashes(prompt: list[int], block_size: int, hash_algo: str) -> list[str]:
-    """Hex prefix-cache hashes of the prompt's full blocks.
-
-    Uses vLLM's own code, so the router side of the RFC is exact. sha256 with
-    no PYTHONHASHSEED uses vLLM's fixed seed, the same in every process.
-    """
-    from vllm.utils.hashing import get_hash_fn_by_name
-    from vllm.v1.core import kv_cache_utils
-
-    hash_fn = get_hash_fn_by_name(hash_algo)
-    kv_cache_utils.init_none_hash(hash_fn)
-    hashes, parent = [], None
-    for start in range(0, len(prompt) - block_size + 1, block_size):
-        parent = kv_cache_utils.hash_block_tokens(
-            hash_fn, parent, prompt[start : start + block_size]
-        )
-        hashes.append(bytes(parent).hex())
-    return hashes
-
-
 def expected_hit(held: list[int], prompt: list[int], block_size: int) -> int:
     """Tokens of `prompt` B should pull: the full blocks it shares with what A
     holds, short of the last token, which B computes for its logits."""
@@ -230,17 +207,17 @@ def greedy(servers: Servers, url: str, body: dict) -> dict:
             "tokens": tokens, "logprobs": logprobs}  # fmt: skip
 
 
-def peer_params(producer: dict, hashes: list[str], identity: dict | None) -> dict:
+def peer_params(producer: dict, identity: dict | None) -> dict:
     """kv_transfer_params for one request to B that asks A by block hash.
 
     One request to B, and B calls A on the NIXL side channel. B hashes the
-    prompt itself; the hashes are sent as a router would send them. A's
-    topology (tp, dcp, pp sizes) lets B heartbeat the pin and release it.
+    prompt itself, so no hashes are sent: vLLM would not read them, and its
+    DEBUG log of these params would grow by ~120 KB per request. A's topology
+    (tp, dcp, pp sizes) lets B heartbeat the pin and release it.
     """
     params = {
         "do_remote_prefill": True,
         "peer_lookup": True,
-        "remote_block_hashes": hashes,
         "remote_engine_id": producer["remote_engine_id"],
         "remote_host": producer["remote_host"],
         "remote_port": producer["remote_port"],
@@ -312,13 +289,12 @@ def run_case(
 
     if args.mode == "peer":
         fresh()
-        hashes = block_hashes(current, args.block_size, args.hash_algo)
         time.sleep(kv.METRICS_WAIT_SECONDS)  # let the warm-up's count land
         a_served = served(servers.producer)
         a_log = log_size(args.producer_log)
         before = kv.metric_totals(servers.consumer, kv.NIXL_METRICS)
         body = {"prompt": current,
-                "kv_transfer_params": peer_params(producer, hashes, args.identity)}  # fmt: skip
+                "kv_transfer_params": peer_params(producer, args.identity)}  # fmt: skip
         peer = greedy(servers, servers.consumer, body)
         peer["transfer"] = kv.metrics_change(servers.consumer, before)
         time.sleep(kv.METRICS_WAIT_SECONDS)
@@ -452,7 +428,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sessions", type=int, default=20)
     parser.add_argument("--max-prompt-tokens", type=int, default=30000)
     parser.add_argument("--block-size", type=int, default=16)
-    parser.add_argument("--hash-algo", default="sha256")
     parser.add_argument("--identity", type=json.loads, default=None,
                         help="kv_identity JSON to send, if the branch needs it")  # fmt: skip
     parser.add_argument("--lookup-pattern", default=LOOKUP_PATTERN)
