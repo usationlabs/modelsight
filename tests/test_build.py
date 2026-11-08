@@ -9,6 +9,7 @@ from modelsight.build import (
     missing_env,
     plan_layers,
     prepare,
+    render_dockerfile,
     resolve_ref,
     resolve_sources,
 )
@@ -176,3 +177,21 @@ def test_missing_env_reports_names_never_values() -> None:
     exp = _experiment(secrets=("HF_TOKEN", "OTHER"))
     assert missing_env(exp, {"HF_TOKEN": "x", "OTHER": ""}) == ["OTHER"]
     assert missing_env(exp, {"HF_TOKEN": "x", "OTHER": "y"}) == []
+
+
+def test_render_dockerfile_inlines_known_args_only() -> None:
+    text = "FROM x\nARG A\narg B=old\nARG C\nRUN echo $A\n"
+    rendered = render_dockerfile(text, (("A", SHA), ("B", "new")))
+    assert rendered == f'FROM x\nARG A="{SHA}"\narg B="new"\nARG C\nRUN echo $A\n'
+
+
+def test_render_dockerfile_changes_with_the_sha() -> None:
+    text = "ARG VLLM_SHA\n"
+    assert render_dockerfile(text, (("VLLM_SHA", SHA),)) != render_dockerfile(
+        text, (("VLLM_SHA", OTHER),)
+    )
+
+
+def test_render_dockerfile_refuses_values_it_cannot_quote() -> None:
+    with pytest.raises(BuildError):
+        render_dockerfile("ARG A\n", (("A", 'a"b'),))
