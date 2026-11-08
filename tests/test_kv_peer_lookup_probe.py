@@ -211,6 +211,18 @@ def test_peer_request_sends_block_hashes_and_producer_address(fakes, tmp_path):
     assert peer[0]["remote_block_hashes"]
 
 
+def test_consumer_pulls_the_address_prefill_first(fakes, tmp_path):
+    # Otherwise A holds its blocks until the lease expires and the first
+    # resets fail.
+    (tmp_path / "out").mkdir()
+    _, consumer = fakes
+
+    h4.main(args(fakes, tmp_path))
+
+    first = consumer.requests[0].get("kv_transfer_params") or {}
+    assert first.get("do_remote_prefill") and first.get("remote_engine_id") == "a"
+
+
 def test_stock_mode_skips_the_peer_checks(fakes, tmp_path):
     (tmp_path / "out").mkdir()
     _, consumer = fakes

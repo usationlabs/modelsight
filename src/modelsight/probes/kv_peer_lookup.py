@@ -445,8 +445,16 @@ def main(argv: list[str] | None = None) -> int:
     kv.wait_ready(servers.consumer)
 
     render = chat_renderer(args.model)
-    # A's side-channel address, from one stock prefill.
-    producer = kv.prefill(servers, kv.fresh_prompt(random.Random(args.seed), 64))
+    # A's side-channel address, from one stock prefill. B then pulls it, so A
+    # frees those blocks now instead of holding them until the lease expires,
+    # which would make the first resets fail.
+    address_prompt = kv.fresh_prompt(random.Random(args.seed), 64)
+    producer = kv.prefill(servers, address_prompt)
+    kv.timed_stream(
+        servers,
+        servers.consumer,
+        {"prompt": address_prompt, "kv_transfer_params": producer},
+    )
 
     records: list[dict] = []
     for n, messages in enumerate(load_sessions(args.traces, args.sessions, args.seed)):
