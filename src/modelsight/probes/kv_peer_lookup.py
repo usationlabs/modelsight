@@ -278,11 +278,20 @@ def run_case(
 
     if case != "miss":
         fresh()
+        # Stock is two requests: A's prefill, then B's pull and decode. Its
+        # TTFT starts at A's prefill request, so time A spends queueing or
+        # computing counts, as the client sees it; b_ttft_s is B's alone.
+        started = time.perf_counter()
         params = kv.prefill(servers, current)
+        prefill_s = time.perf_counter() - started
         before = kv.metric_totals(servers.consumer, kv.NIXL_METRICS)
         stock = greedy(
             servers, servers.consumer, {"prompt": current, "kv_transfer_params": params}
         )
+        stock["b_ttft_s"] = stock["ttft_s"]
+        stock["prefill_s"] = prefill_s
+        stock["ttft_s"] = prefill_s + stock["b_ttft_s"]
+        stock["total_s"] += prefill_s
         stock["transfer"] = kv.metrics_change(servers.consumer, before)
         stock["pulled_tokens"] = expected_hit(current, current, args.block_size)
         record["stock"] = stock
@@ -366,7 +375,11 @@ def check(records: list[dict], mode: str, leak_free: bool) -> dict:
 
 
 def latency(records: list[dict]) -> dict:
-    """Median B TTFT per case and arm."""
+    """Median end-to-end TTFT per case and arm, from the client's first request.
+
+    ``stock_b`` is stock's TTFT measured from B's request alone, which leaves
+    out A's prefill request.
+    """
     table: dict = {}
     for case in CASES:
         rows = [r for r in records if r["case"] == case]
@@ -375,6 +388,10 @@ def latency(records: list[dict]) -> dict:
             for arm in ("recompute", "stock", "peer")
             if any(arm in r for r in rows)
         }
+        stock_b = [r["stock"]["b_ttft_s"] for r in rows
+                   if "stock" in r and "b_ttft_s" in r["stock"]]  # fmt: skip
+        if stock_b:
+            table[case]["stock_b"] = statistics.median(stock_b)
     return table
 
 
@@ -402,13 +419,14 @@ def pull_rates(records: list[dict]) -> dict:
 
 
 def print_summary(checks: dict, table: dict) -> None:
-    print("case     recompute_s  stock_s  peer_s")
+    print("case     recompute_s  stock_s  peer_s  stock_b_s")
     for case, arms in table.items():
         cells = [
             f"{arms[a]:.3f}" if a in arms else "-"
-            for a in ("recompute", "stock", "peer")
+            for a in ("recompute", "stock", "peer", "stock_b")
         ]
-        print(f"{case:<8} {cells[0]:>11}  {cells[1]:>7}  {cells[2]:>6}")
+        print(f"{case:<8} {cells[0]:>11}  {cells[1]:>7}  {cells[2]:>6}  {cells[3]:>9}")
+    print("stock_s counts A's prefill request; stock_b_s is B's request alone")
     for name, result in checks.items():
         if isinstance(result, dict):
             state = {True: "PASS", False: "FAIL", None: "skip"}[result["ok"]]

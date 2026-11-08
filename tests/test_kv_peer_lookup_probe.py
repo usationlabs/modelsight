@@ -316,3 +316,35 @@ def test_pull_rates_use_vllm_transfer_metrics():
     assert rates == {
         "peer": {"gbps_median": 1.5, "descriptors_median": 33, "transfers": 2}
     }
+
+
+def test_stock_ttft_counts_the_prefill_request_to_a(fakes, tmp_path):
+    (tmp_path / "out").mkdir()
+
+    assert h4.main(args(fakes, tmp_path)) == 0
+
+    result = results(tmp_path)
+    stocks = [r["stock"] for r in result["records"] if "stock" in r]
+    assert stocks
+    for stock in stocks:
+        assert stock["prefill_s"] > 0
+        assert stock["ttft_s"] == stock["prefill_s"] + stock["b_ttft_s"]
+    for case in ("full", "partial"):
+        row = result["latency"][case]
+        assert row["stock"] >= row["stock_b"]
+
+
+def test_latency_reports_stock_end_to_end_and_b_alone():
+    records = [
+        {"case": "full", "recompute": {"ttft_s": 1.0}, "peer": {"ttft_s": 0.2},
+         "stock": {"ttft_s": 0.15, "b_ttft_s": 0.1, "prefill_s": 0.05}},
+    ]  # fmt: skip
+
+    table = h4.latency(records)
+
+    assert table["full"] == {
+        "recompute": 1.0,
+        "stock": 0.15,
+        "peer": 0.2,
+        "stock_b": 0.1,
+    }
