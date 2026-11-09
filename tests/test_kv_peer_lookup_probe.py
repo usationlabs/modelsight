@@ -33,7 +33,10 @@ class FakeVllm:
         self.log = log
         self.producer = producer
         self.cache: set[tuple[int, ...]] = set()
+        self.salts: dict[tuple[int, ...], set[str]] = {}
         self.requests: list[dict] = []
+        self.resets = 0
+        self.load_file: Path | None = None  # exists while a fake AIPerf runs
         self.served = 0
         self.transfers = 0
         self.bytes = 0
@@ -61,25 +64,35 @@ class FakeVllm:
                 size = int(self.headers.get("Content-Length") or 0)
                 if self.path.startswith("/reset_prefix_cache"):
                     fake.cache.clear()
+                    fake.salts.clear()
+                    fake.resets += 1
                     self._reply(json.dumps({"success": not fake.leak}).encode())
                     return
                 body = json.loads(self.rfile.read(size))
-                fake.requests.append(body)
-                self._reply(fake.complete(body))
+                request_id = self.headers.get("X-Request-Id")
+                fake.requests.append({**body, "_request_id": request_id})
+                self._reply(fake.complete(body, request_id))
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def complete(self, body: dict) -> bytes:
+    def holds(self, salt: str) -> set[tuple[int, ...]]:
+        return {p for p in self.cache if salt in self.salts.get(p, {""})}
+
+    def complete(self, body: dict, request_id: str | None = None) -> bytes:
         prompt = tuple(body["prompt"])
+        salt = body.get("cache_salt") or ""
         params = body.get("kv_transfer_params") or {}
+        if request_id and self.log.exists():
+            with self.log.open("a") as f:
+                f.write(f"DEBUG request_finished(cmpl-{request_id})\n")
         if params.get("peer_lookup"):
             producer = self.producer
             hit = h4.expected_hit(
                 list(
                     max(
-                        producer.cache,
+                        producer.holds(salt),
                         key=lambda p: held_prefix({p}, prompt),
                         default=(),
                     )
@@ -93,6 +106,8 @@ class FakeVllm:
                 )
             if producer.serve_peer:
                 producer.served += 1
+                with producer.log.open("a") as f:
+                    f.write(f"DEBUG request_finished(cmpl-{request_id})\n")
             if hit:
                 self.transfers += 1
                 self.bytes += hit * BYTES_PER_TOKEN
@@ -102,6 +117,7 @@ class FakeVllm:
                 h4.expected_hit(list(prompt), list(prompt), BLOCK) * BYTES_PER_TOKEN
             )
         self.cache.add(prompt)
+        self.salts.setdefault(prompt, set()).add(salt)
         self.served += 1
         if not body.get("stream"):
             out = {"do_remote_prefill": True, "remote_engine_id": "a",
@@ -116,7 +132,12 @@ class FakeVllm:
         return f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode()
 
     def metrics(self) -> str:
+        running = 0
+        if self.load_file is not None and self.load_file.exists():
+            running = int(self.load_file.read_text() or 0)
         return (
+            f"vllm:num_requests_running {running}\n"
+            "vllm:num_requests_waiting 0\n"
             f'vllm:nixl_bytes_transferred_count{{m="q"}} {self.transfers}\n'
             f'vllm:nixl_bytes_transferred_sum{{m="q"}} {self.bytes}\n'
             f'vllm:request_success_total{{m="q",reason="stop"}} {self.served}\n'

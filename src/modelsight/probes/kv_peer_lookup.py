@@ -186,13 +186,15 @@ def reset_cache(url: str, attempts: int = RESET_ATTEMPTS) -> bool:
     return False
 
 
-def greedy(servers: Servers, url: str, body: dict) -> dict:
+def greedy(
+    servers: Servers, url: str, body: dict, headers: dict | None = None
+) -> dict:
     """TTFT and the first CHECK_TOKENS greedy tokens with their logprobs."""
     started = time.perf_counter()
     first, tokens, logprobs = None, [], []
     stream = {**body, "stream": True, "max_tokens": CHECK_TOKENS, "logprobs": 1,
               "ignore_eos": True}  # fmt: skip
-    with kv.post(servers, url, stream) as response:
+    with kv.post(servers, url, stream, headers) as response:
         for line in response:
             if not line.startswith(b"data:") or b"[DONE]" in line:
                 continue
@@ -360,7 +362,9 @@ def check(records: list[dict], mode: str, leak_free: bool) -> dict:
             ok = pulled > 0
         else:
             ok = abs(pulled - expected * rate) <= BYTES_TOLERANCE * expected * rate
-        if not ok:
+        # Under load, a peer arm can miss because A evicted its prefix; the
+        # load probe marks those, and they are reported, not failed.
+        if not ok and not peer.get("evicted"):
             failures["pulled"].append(i)
     fraction = equal / compared if compared else 1.0
     result = {name: {"ok": not idx, "records": idx} for name, idx in failures.items()}

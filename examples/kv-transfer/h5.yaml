@@ -1,0 +1,106 @@
+# H5: does peer lookup-and-pin still beat stock when A is busy?
+#
+# H4 measured an idle A. Here AIPerf keeps N agent sessions running on A, one
+# level after another (N = 0, 1, 2, 4, 8, 16, 32; 0 is H4), and at each level the
+# probe measures the same cases and arms as H4 while the load runs:
+#
+#   recompute  B computes the prompt itself
+#   stock      A prefills (queued behind its load), then B pulls; timed from the
+#              prefill request to A until B's first token
+#   peer       one request to B; B asks A by hash, A pins, B pulls
+#
+# A cannot reset its prefix cache under load, so each arm uses its own
+# cache_salt. The probe starts and stops AIPerf for every level, waits until A
+# runs about N requests before it measures, and records what A really ran.
+#
+# Design, inputs and expected outcomes: examples/kv-transfer/h5.md
+#
+# Prepare once, with no GPU:  uv run ms build -f examples/kv-transfer/h5.yaml
+# Run, with streamed logs:    uv run ms run -f examples/kv-transfer/h5.yaml --detach
+target: modal
+gpu: A100-80GB:2
+dockerfile: Dockerfile.h4
+sources:
+  VLLM:
+    repo: https://github.com/usationlabs/vllm
+    ref: feat/nixl-peer-lookup-pin
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [Qwen/Qwen3-8B]
+
+ready_url: http://localhost:8200/health
+ready_timeout: 15m
+timeout: 150m
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch) '
+  - pip show vllm 2>/dev/null | grep -i -E '^(version|location)'
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - nvidia-smi nvlink --status
+
+# Each server's lines are tagged [A] or [B]. Both run as kv_both so either can
+# pull, and VLLM_SERVER_DEV_MODE exposes /reset_prefix_cache, which the probe
+# uses between cases and for the leak check. The run stops if either exits.
+server: |
+  bash <<'EOF'
+  export PYTHONPATH=/opt/nixl-error-mode
+  export VLLM_SERVER_DEV_MODE=1
+  # UCX_PROTO_INFO prints the protocol UCX picks for each operation, so B's
+  # log shows the transport its KV reads take (cuda_ipc: GPU to GPU).
+  export UCX_RCACHE_MAX_UNRELEASED=1024 UCX_PROTO_INFO=y
+
+  # vLLM logs at INFO, but the peer lookup modules at DEBUG, so A's log shows
+  # each lookup ("lookup_pin") and every finished request with its id, which is
+  # how the probe checks that A served nothing for a peer arm. The engine core
+  # and scheduler stay at INFO: under load they would log every step.
+  cat > /tmp/vllm-logging.json <<'JSON'
+  {
+    "version": 1,
+    "disable_existing_loggers": false,
+    "formatters": {"vllm": {"()": "vllm.logging_utils.NewLineFormatter",
+      "datefmt": "%m-%d %H:%M:%S",
+      "format": "(%(vllm_process_name)s pid=%(process)d) %(levelname)s %(asctime)s.%(msecs)03d [%(fileinfo)s:%(lineno)d] %(message)s"}},
+    "handlers": {"vllm": {"class": "logging.StreamHandler", "formatter": "vllm",
+      "level": "DEBUG", "stream": "ext://sys.stdout"}},
+    "loggers": {
+      "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": false},
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.peer_pins": {"level": "DEBUG"},
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler": {"level": "DEBUG"},
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker": {"level": "DEBUG"}
+    }
+  }
+  JSON
+  export VLLM_LOGGING_CONFIG_PATH=/tmp/vllm-logging.json
+
+  # --no-enable-extensible-kv-cache: vLLM's extensible KV cache maps its memory
+  # with CUDA VMM, which legacy CUDA IPC cannot export, so UCX reads it through
+  # host shared memory (sysv, ~0.5 GB/s) instead of cuda_ipc (~190 GB/s here).
+  serve() {
+    CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL vllm serve Qwen/Qwen3-8B \
+      --port $3 \
+      --max-model-len 32768 \
+      --gpu-memory-utilization 0.9 \
+      --prefix-caching-hash-algo sha256 \
+      --no-enable-extensible-kv-cache \
+      --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"peer_lookup":true}}' \
+      2>&1 | tee /tmp/server-$1.log | sed -u "s/^/[$1] /"
+  }
+
+  serve A 0 8100 5600 &
+  serve B 1 8200 5601 &
+  wait -n
+  EOF
+
+# The container mounts modelsight at /root/modelsight. ms installs AIPerf in the
+# image; the probe runs it, one run per level, against A.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_peer_load
+  --model Qwen/Qwen3-8B
+  --producer http://localhost:8100
+  --consumer http://localhost:8200
+  --producer-log /tmp/server-A.log
+  --consumer-log /tmp/server-B.log
+  --levels 0,1,2,4,8,16,32
+  --sessions 10
+  --max-prompt-tokens 30000
