@@ -13,8 +13,6 @@
 # cache_salt. The probe starts and stops AIPerf for every level, waits until A
 # runs about min(N, 16) requests before it measures, and records what A really ran.
 #
-# Design, inputs and expected outcomes: examples/kv-transfer/h5.md
-#
 # Prepare once, with no GPU:  uv run ms build -f examples/kv-transfer/h5.yaml
 # Run, with streamed logs:    uv run ms run -f examples/kv-transfer/h5.yaml --detach
 target: modal
