@@ -124,11 +124,13 @@ class FakeVllm:
                    "remote_host": "h", "remote_port": 1, "remote_block_ids": [0]}  # fmt: skip
             return json.dumps({"kv_transfer_params": out}).encode()
         word = "x" if self.wrong_tokens and params else f"t{sum(prompt) % 7}"
+        logprob = -5.0 if word == "x" else -0.1  # corrupt KV picks an unlikely token
         chunk = {
             "choices": [
-                {"text": word, "logprobs": {"tokens": [word], "token_logprobs": [-0.1]}}
+                {"text": word,
+                 "logprobs": {"tokens": [word], "token_logprobs": [logprob]}}
             ]
-        }
+        }  # fmt: skip
         return f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode()
 
     def metrics(self) -> str:
@@ -280,6 +282,16 @@ def test_fails_when_pulled_kv_changes_the_output(fakes, tmp_path):
 
     assert h4.main(args(fakes, tmp_path)) == 1
     assert results(tmp_path)["checks"]["equivalent"]["ok"] is False
+
+
+def test_a_near_tie_is_not_a_failed_equivalence():
+    reference = {"tokens": ["a", "b", "c"], "logprobs": [-0.1, -0.70, -0.1]}
+    tie = {"tokens": ["a", "x", "z"], "logprobs": [-0.1, -0.75, -0.2]}
+    corrupt = {"tokens": ["a", "x", "z"], "logprobs": [-0.1, -4.0, -0.2]}
+
+    assert h4.is_near_tie(tie, reference)
+    assert not h4.is_near_tie(corrupt, reference)
+    assert not h4.is_near_tie(reference, reference)  # no difference, no tie
 
 
 def test_expected_hit_counts_shared_full_blocks_short_of_the_last_token():

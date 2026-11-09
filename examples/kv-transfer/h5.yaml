@@ -73,6 +73,7 @@ server: |
   JSON
   export VLLM_LOGGING_CONFIG_PATH=/tmp/vllm-logging.json
 
+  # --max-num-seqs 16 is kv_peer_load.A_MAX_SEQS: sessions beyond it queue on A.
   # --no-enable-extensible-kv-cache: vLLM's extensible KV cache maps its memory
   # with CUDA VMM, which legacy CUDA IPC cannot export, so UCX reads it through
   # host shared memory (sysv, ~0.5 GB/s) instead of cuda_ipc (~190 GB/s here).
@@ -83,6 +84,7 @@ server: |
       --gpu-memory-utilization 0.9 \
       --prefix-caching-hash-algo sha256 \
       --no-enable-extensible-kv-cache \
+      --max-num-seqs 16 \
       --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"peer_lookup":true}}' \
       2>&1 | tee /tmp/server-$1.log | sed -u "s/^/[$1] /"
   }
@@ -101,6 +103,6 @@ bench: >-
   --consumer http://localhost:8200
   --producer-log /tmp/server-A.log
   --consumer-log /tmp/server-B.log
-  --levels 0,1,2,4,8,16,32
+  --levels 0,8,16,32,64,128
   --sessions 10
   --max-prompt-tokens 30000

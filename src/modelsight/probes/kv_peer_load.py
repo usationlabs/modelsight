@@ -40,7 +40,11 @@ from modelsight.probes import kv_peer_lookup as h4
 from modelsight.probes import kv_transfer as kv
 from modelsight.probes.kv_transfer import Servers
 
-DEFAULT_LEVELS = "0,1,2,4,8,16,32"
+DEFAULT_LEVELS = "0,8,16,32,64,128"
+# A runs at most this many requests at once (h5.yaml passes it as
+# --max-num-seqs). Background sessions beyond it wait in A's queue, which is the
+# state H5 needs: stock's prefill request has to stand in that queue.
+A_MAX_SEQS = 16
 LOAD_TOKENS = 128_000
 MAX_MODEL_LEN = 32_768
 LOAD_OUTPUT_TOKENS = 256
@@ -70,10 +74,12 @@ def parse_levels(text: str) -> list[int]:
 def prompt_cap(level: int) -> int:
     """Longest prompt a background session may send at this level.
 
-    The load shares LOAD_TOKENS between its N sessions, and no prompt can
-    outgrow the engine's context window.
+    The requests A runs at once (at most A_MAX_SEQS) share LOAD_TOKENS, and no
+    prompt can outgrow the engine's context window. Sessions beyond A_MAX_SEQS
+    wait without holding KV, so they do not shrink the cap.
     """
-    return min(LOAD_TOKENS // level, MAX_MODEL_LEN - LOAD_OUTPUT_TOKENS - 64)
+    running = min(level, A_MAX_SEQS)
+    return min(LOAD_TOKENS // running, MAX_MODEL_LEN - LOAD_OUTPUT_TOKENS - 64)
 
 
 def background_turns(render, messages: list[dict], cap: int) -> list[str]:
@@ -245,8 +251,8 @@ class Load:
 
 def wait_loaded(url: str, level: int, load: Load | None,
                 timeout: float = SETTLE_TIMEOUT_SECONDS) -> dict:
-    """Wait until A runs about `level` requests; report what it got."""
-    target = max(1.0, REACHED_FRACTION * level)
+    """Wait until A runs about `level` requests (at most A_MAX_SEQS)."""
+    target = max(1.0, REACHED_FRACTION * min(level, A_MAX_SEQS))
     deadline = time.monotonic() + timeout
     state = load_state(url)
     while state["running"] < target and time.monotonic() < deadline:
@@ -432,6 +438,9 @@ def run_level(
         if load is not None:
             info["settle"] = wait_loaded(servers.producer, level, active)
             print(json.dumps({"level": level, **info["settle"]}), flush=True)
+            if level > A_MAX_SEQS and not info["settle"]["waiting"]:
+                print(f"warning: level {level} has more sessions than A runs at once "
+                      f"({A_MAX_SEQS}), but A has no queue", flush=True)  # fmt: skip
         for n, (previous, current) in enumerate(measured):
             for case in h4.CASES:
                 try:

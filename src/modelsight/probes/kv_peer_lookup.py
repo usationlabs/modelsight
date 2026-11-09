@@ -55,6 +55,9 @@ CHECK_TOKENS = 16
 # Relative error allowed between pulled bytes and the calibrated expectation.
 BYTES_TOLERANCE = 0.1
 MIN_EQUIVALENT_FRACTION = 0.95
+# Two outputs that first differ where the chosen tokens' logprobs are this close
+# are a numeric tie, not a corrupt pull.
+TIE_LOGPROB = 0.25
 LOOKUP_PATTERN = r"lookup[_ -]?pin"
 REQUEST_METRICS = {"vllm:request_success_total": "served"}
 RESET_ATTEMPTS = 10
@@ -323,6 +326,25 @@ def matches(a: dict, b: dict) -> bool:
     return a["tokens"] == b["tokens"]
 
 
+def is_near_tie(a: dict, b: dict) -> bool:
+    """Whether two outputs first differ where the model was nearly undecided.
+
+    Loaded KV and recomputed KV differ by floating-point noise, which can flip a
+    greedy choice between two almost equally likely tokens. At that position
+    both arms' chosen tokens have about the same logprob. Corrupt KV would pick
+    a token the other arm gave a much lower logprob.
+    """
+    at = next(
+        (i for i, (x, y) in enumerate(zip(a["tokens"], b["tokens"])) if x != y), None
+    )
+    if at is None:
+        return False
+    lps = (a.get("logprobs") or [], b.get("logprobs") or [])
+    if any(len(lp) <= at for lp in lps):
+        return False
+    return abs(lps[0][at] - lps[1][at]) <= TIE_LOGPROB
+
+
 def bytes_per_token(records: list[dict]) -> float | None:
     """From the stock arm, where the pulled length is known."""
     rates = [
@@ -341,12 +363,15 @@ def check(records: list[dict], mode: str, leak_free: bool) -> dict:
         "served": [], "lookup": [], "pulled": [], "equivalent": []
     }  # fmt: skip
     rate = bytes_per_token(records)
-    compared = equal = 0
+    compared = equal = ties = 0
     for i, r in enumerate(records):
         for arm in ("stock", "peer"):
             if arm in r:
                 compared += 1
-                equal += matches(r[arm], r["recompute"])
+                if matches(r[arm], r["recompute"]):
+                    equal += 1
+                elif is_near_tie(r[arm], r["recompute"]):
+                    ties += 1
         if mode != "peer":
             continue
         peer = r["peer"]
@@ -366,13 +391,14 @@ def check(records: list[dict], mode: str, leak_free: bool) -> dict:
         # load probe marks those, and they are reported, not failed.
         if not ok and not peer.get("evicted"):
             failures["pulled"].append(i)
-    fraction = equal / compared if compared else 1.0
+    fraction = (equal + ties) / compared if compared else 1.0
     result = {name: {"ok": not idx, "records": idx} for name, idx in failures.items()}
     if mode != "peer":
         for name in ("served", "lookup", "pulled"):
             result[name] = {"ok": None, "records": []}
     result["equivalent"] = {"ok": fraction >= MIN_EQUIVALENT_FRACTION,
-                            "fraction": fraction, "compared": compared}  # fmt: skip
+                            "fraction": fraction, "compared": compared,
+                            "exact": equal, "near_ties": ties}  # fmt: skip
     result["no_leaks"] = {"ok": leak_free}
     result["bytes_per_token"] = rate
     return result

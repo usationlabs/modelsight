@@ -81,7 +81,8 @@ def results(tmp_path) -> dict:
 
 def test_prompt_cap_shares_the_load_and_stops_at_the_context_window():
     assert h5.prompt_cap(8) == 16_000
-    assert h5.prompt_cap(32) == 4_000
+    # sessions beyond what A runs at once queue without holding KV
+    assert h5.prompt_cap(32) == h5.prompt_cap(128) == 128_000 // h5.A_MAX_SEQS
     # 128k / 1 would outgrow the engine, so the window decides
     assert h5.prompt_cap(1) == h5.MAX_MODEL_LEN - h5.LOAD_OUTPUT_TOKENS - 64
     assert h5.prompt_cap(2) == h5.prompt_cap(1)
