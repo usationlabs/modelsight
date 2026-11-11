@@ -81,10 +81,12 @@ def test_registry_image_gets_ms_tooling_and_the_modelsight_mount() -> None:
 
 
 def test_dockerfile_is_built_with_its_directory_as_context_and_resolved_args(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    rendered_dir = tmp_path / "rendered"
+    monkeypatch.setattr(target, "RENDERED_DOCKERFILES", rendered_dir)
     dockerfile = tmp_path / "Dockerfile"
-    dockerfile.write_text("FROM scratch\n")
+    dockerfile.write_text("FROM scratch\nARG DYNAMO_SHA\nRUN echo $DYNAMO_SHA\n")
     exp = _experiment(
         image=None,
         dockerfile=str(dockerfile),
@@ -96,7 +98,8 @@ def test_dockerfile_is_built_with_its_directory_as_context_and_resolved_args(
     calls = target.build_image(exp, prepare(exp, lambda repo, ref: SHA)).calls
     kind, path, context, args, add_python = calls[0]
     assert kind == "from_dockerfile"
-    assert path == dockerfile and context == tmp_path
+    assert context == tmp_path and path.parent == rendered_dir
+    assert path.read_text() == f'FROM scratch\nARG DYNAMO_SHA="{SHA}"\nRUN echo $DYNAMO_SHA\n'
     assert args == {
         "JOBS": "8",
         "DYNAMO_REPO": "https://x/dynamo",

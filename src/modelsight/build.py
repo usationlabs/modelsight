@@ -7,8 +7,10 @@ Modal caches an image layer by its content: if the base and the instructions up
 to a layer are unchanged, that layer is reused. `sources` give a Dockerfile git
 repositories at a moving ref; each ref is resolved to a commit SHA first and
 passed as a build arg, so a branch that moved changes the layer that uses it,
-and only that layer and the ones after it. The fingerprint hashes the same
-inputs, so a run can say whether it will reuse the cache.
+and only that layer and the ones after it. Modal does not count build arg
+values when it decides whether a layer changed, so `render_dockerfile` also
+writes each value into its `ARG` line. The fingerprint hashes the same inputs,
+so a run can say whether it will reuse the cache.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ UV_VERSION = "0.12.5"
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _SHORT_SHA = re.compile(r"[0-9a-f]{7,39}")
 _LS_REMOTE_TIMEOUT_SECONDS = 60
+_ARG_LINE = re.compile(r"^(\s*ARG\s+)([A-Za-z_][A-Za-z0-9_]*)(=\S*)?\s*$", re.IGNORECASE)
 
 
 class BuildError(Exception):
@@ -187,6 +190,26 @@ def prepare(exp: Experiment, resolver: Resolver | None = None) -> Prepared:
     return Prepared(
         build_args, sources, layers, fingerprint(exp, dockerfile_text, build_args, layers)
     )
+
+
+def render_dockerfile(text: str, build_args: tuple[tuple[str, str], ...]) -> str:
+    """The Dockerfile with each build arg's value as its `ARG` default.
+
+    A changed value then changes the instruction text that Modal hashes, so the
+    layers from that `ARG` on are rebuilt instead of reused.
+    """
+    values = dict(build_args)
+    lines = []
+    for line in text.splitlines(keepends=True):
+        match = _ARG_LINE.match(line.rstrip("\n"))
+        if match and match.group(2) in values:
+            value = values[match.group(2)]
+            if re.search(r'["\\$\s]', value):
+                raise BuildError(f"build arg {match.group(2)} has a value ms cannot inline")
+            end = "\n" if line.endswith("\n") else ""
+            line = f'{match.group(1)}{match.group(2)}="{value}"{end}'
+        lines.append(line)
+    return "".join(lines)
 
 
 def missing_env(exp: Experiment, environ: Mapping[str, str] | None = None) -> list[str]:

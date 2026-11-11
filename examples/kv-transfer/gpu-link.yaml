@@ -1,0 +1,54 @@
+# GPU link: which UCX transport NIXL uses between two GPUs, and how fast it reads.
+#
+# No model. modelsight.probes.nixl_bandwidth measures, on the same two-GPU Modal
+# machine H1-H4 run on:
+#
+#   peer_copy  torch GPU0 -> GPU1 in one process: the raw link (NVLink or PCIe)
+#   nixl_read  a process on GPU1 READs a 4 GiB buffer that a process on GPU0
+#              registered with NIXL, split into 1 to 16,384 descriptors.
+#              36 matches vLLM's pulls in H4.
+#
+# The initiator runs with UCX_PROTO_INFO=y, so results.json and
+# nixl-initiator.log show the protocol UCX picked for reads (cuda_ipc means a
+# direct GPU-to-GPU copy). `nvidia-smi topo -m` fails on Modal, so the report
+# uses `nvidia-smi nvlink --status` instead.
+#
+# It uses H4's image, so it measures the same NIXL and UCX that vLLM loads.
+#
+# Prepare once, with no GPU:  uv run ms build -f examples/kv-transfer/gpu-link.yaml
+# Run, with streamed logs:    uv run ms run -f examples/kv-transfer/gpu-link.yaml --detach
+target: modal
+gpu: A100-80GB:2
+dockerfile: Dockerfile.h4
+sources:
+  VLLM:
+    repo: https://github.com/usationlabs/vllm
+    ref: feat/nixl-peer-lookup-pin
+secrets: [HF_TOKEN]
+
+ready_url: http://localhost:8000/
+ready_timeout: 2m
+timeout: 30m
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch|ucx)'
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - nvidia-smi nvlink --status
+  - ucx_info -v
+  - ucx_info -d | grep -E 'Transport|Device'
+
+# Nothing to serve; ms waits for a server, so give it one that answers at once.
+server: python3 -m http.server 8000 --bind 127.0.0.1
+
+# The container mounts modelsight at /root/modelsight. The probe runs twice:
+# with NIXL's default of no UCX worker threads (results.json), then with the 4
+# that vLLM's NixlConnector uses (results-threads4.json). In H4, vLLM's reads
+# took "software emulation | sysv/memory" instead of cuda_ipc; the second run
+# shows whether the threads are why.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.nixl_bandwidth
+  --size-gib 4 --descriptors 1,36,431,4096,16384 --repeats 5
+  --num-threads 0 --output results.json;
+  PYTHONPATH=/root python -m modelsight.probes.nixl_bandwidth
+  --size-gib 4 --descriptors 1,36,431,4096,16384 --repeats 5
+  --num-threads 4 --port 5710 --output results-threads4.json

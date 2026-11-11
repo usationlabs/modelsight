@@ -1,0 +1,30 @@
+# vLLM from the peer lookup-and-pin branch, with
+# the NIXL that branch pins, plus the error mode NIXL needs on Modal.
+# VLLM_USE_PRECOMPILED reuses the kernels of the nearest nightly wheel, so the
+# build only installs the branch's Python.
+FROM nvidia/cuda:13.2.1-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential curl ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/0.12.5/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh \
+    && uv venv /opt/venv --python 3.12 \
+    && uv pip install --python /opt/venv/bin/python pip
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN uv pip install --python /opt/venv/bin/python nixl==1.5.2 datasets
+
+# h4.yaml's `sources` resolves the branch to a commit, so a push to the branch
+# rebuilds only from here.
+ARG VLLM_REPO
+ARG VLLM_SHA
+RUN VLLM_USE_PRECOMPILED=1 uv pip install --python /opt/venv/bin/python \
+        "vllm @ git+${VLLM_REPO}@${VLLM_SHA}"
+
+# py-spy samples B's engine, so its profile shows where a step blocks.
+RUN uv pip install --python /opt/venv/bin/python py-spy==0.4.0
+
+COPY sitecustomize.py /opt/nixl-error-mode/sitecustomize.py
