@@ -1,0 +1,47 @@
+# The H4 image (vLLM from the peer lookup-and-pin branch, with the NIXL it
+# pins) plus vllm-router from the shadow planner branch. The vLLM layers are
+# Dockerfile.h4's, line for line, so they stay cached; the router builds last,
+# so a router push rebuilds only from its layers.
+FROM nvidia/cuda:13.2.1-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential curl ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/0.12.5/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh \
+    && uv venv /opt/venv --python 3.12 \
+    && uv pip install --python /opt/venv/bin/python pip
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN uv pip install --python /opt/venv/bin/python nixl==1.5.2 datasets
+
+# h4.yaml's `sources` resolves the branch to a commit, so a push to the branch
+# rebuilds only from here.
+ARG VLLM_REPO
+ARG VLLM_SHA
+RUN VLLM_USE_PRECOMPILED=1 uv pip install --python /opt/venv/bin/python \
+        "vllm @ git+${VLLM_REPO}@${VLLM_SHA}"
+
+# py-spy samples B's engine, so its profile shows where a step blocks.
+RUN uv pip install --python /opt/venv/bin/python py-spy==0.4.0
+
+COPY sitecustomize.py /opt/nixl-error-mode/sitecustomize.py
+
+# The router is plain Rust: libzmq is built from source by its crate, which
+# needs cmake. A release build takes several minutes, once per router commit.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:$PATH
+
+# shadow_kv_transfer_planner.yaml's `sources` resolves the branch to a commit.
+ARG ROUTER_REPO
+ARG ROUTER_SHA
+RUN git clone --filter=blob:none "${ROUTER_REPO}" /opt/router-src \
+    && cd /opt/router-src && git checkout --quiet "${ROUTER_SHA}" \
+    && cargo build --release --locked --bin vllm-router \
+    && install -m 0755 target/release/vllm-router /usr/local/bin/vllm-router \
+    && rm -rf /opt/router-src /root/.cargo/registry /root/.cargo/git

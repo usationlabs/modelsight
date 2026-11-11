@@ -1,0 +1,123 @@
+# What would the router's shadow KV transfer planner do on real agent traffic?
+#
+# H5 measured what a peer fetch costs. This experiment asks how often a router would want
+# one. Two engines publish KV events, and vllm-router routes between them with
+# kv_aware and the transfer planner in shadow mode: for every request it decides
+# whether copying a cached prefix from a busier peer would beat waiting there,
+# counts the answer and its cost estimates, and changes nothing.
+#
+# Every level replays the same 128 agent sessions, each from its first turn to
+# its last, with N = 8, 16, 32 or 64 of them in flight at once. A level is a
+# fixed amount of work, not a fixed time, so every level sends the same
+# prompts and only the load differs; a time limit would let a loaded level get
+# through fewer turns per session, and so send shorter prompts. A level ends
+# when its last session does, so light levels take longer (about 25 minutes at
+# N = 8, about 10 at N = 64). Towards the end of a level the last sessions run
+# alone, so the load falls off; the engine load samples show it. The probe reads
+# what each level added to the router's metrics:
+#
+#   outcomes   planned, or why not (no_peer, source_not_busy, cost_rule, ...)
+#   estimates  fetch and wait cost, and saved time, from the planner's histograms
+#   inputs     how many requests the router could tokenize and identify
+#   load       A's and B's running and waiting requests
+#
+# Each engine runs at most 16 requests at once, as A did in H5, so from N = 32
+# up requests queue, which is where H5's break-even (8 to 16 running) lies. The
+# cost constants are the router's placeholders; this run is what calibrates them.
+#
+# Prepare once, with no GPU:  uv run ms build -f examples/kv-transfer/shadow_kv_transfer_planner.yaml
+# Run, with streamed logs:    uv run ms run -f examples/kv-transfer/shadow_kv_transfer_planner.yaml --detach
+target: modal
+gpu: A100-80GB:2
+dockerfile: Dockerfile.shadow_kv_transfer_planner
+sources:
+  # Shadow mode needs no engine change. This branch keeps the vLLM of H4 and H5,
+  # so their numbers apply, and it serves the render endpoints the router
+  # tokenizes chat requests with.
+  VLLM:
+    repo: https://github.com/usationlabs/vllm
+    ref: feat/nixl-peer-lookup-pin
+  ROUTER:
+    repo: https://github.com/usationlabs/router
+    ref: feat/peer-kv-fetch
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [Qwen/Qwen3-8B]
+
+ready_url: http://localhost:8000/health
+ready_timeout: 20m
+timeout: 150m
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|torch) '
+  - vllm-router --version || true
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+
+# Lines are tagged [A], [B] or [R]. The router starts once both engines are
+# healthy, and the run stops if any of the three exits.
+server: |
+  bash <<'EOF'
+  # VLLM_SERVER_DEV_MODE exposes /reset_prefix_cache, which the probe calls
+  # between levels so each one starts cold.
+  export VLLM_SERVER_DEV_MODE=1
+
+  # --enable-scale-out serves /v1/chat/completions/render, which the router
+  # calls to get each request's token ids; without it every request is
+  # missing_tokens. --block-size 16 must match --kv-event-block-size below.
+  # --max-num-seqs 16 is H5's running limit (kv_peer_load.A_MAX_SEQS).
+  serve() {
+    CUDA_VISIBLE_DEVICES=$2 stdbuf -oL vllm serve Qwen/Qwen3-8B \
+      --port $3 \
+      --max-model-len 32768 \
+      --gpu-memory-utilization 0.9 \
+      --block-size 16 \
+      --max-num-seqs 16 \
+      --enable-prefix-caching \
+      --enable-scale-out \
+      --kv-events-config "{\"enable_kv_cache_events\": true, \"publisher\": \"zmq\", \"endpoint\": \"tcp://*:$4\", \"replay_endpoint\": \"tcp://*:$5\"}" \
+      2>&1 | tee /tmp/server-$1.log | sed -u "s/^/[$1] /"
+  }
+
+  serve A 0 8100 5557 5558 &
+  serve B 1 8200 5567 5568 &
+
+  until curl -sf localhost:8100/health && curl -sf localhost:8200/health; do
+    sleep 5
+  done
+
+  # The engines' KV event endpoints are given statically: the router's HTTP
+  # discovery does not read vLLM's model and block size (plan D.1), and both
+  # engines need the same --kv-event-model to share a cache identity, or every
+  # request is no_peer. Planner settings are the defaults of plan D.2.
+  stdbuf -oL vllm-router \
+    --host 127.0.0.1 --port 8000 \
+    --worker-urls http://localhost:8100 http://localhost:8200 \
+    --policy kv_aware \
+    --kv-event-source http://localhost:8100=tcp://localhost:5557 \
+    --kv-event-source http://localhost:8200=tcp://localhost:5567 \
+    --kv-event-replay-source http://localhost:8100=tcp://localhost:5558 \
+    --kv-event-replay-source http://localhost:8200=tcp://localhost:5568 \
+    --kv-event-model Qwen/Qwen3-8B \
+    --kv-event-block-size 16 \
+    --kv-transfer-mode shadow \
+    --prometheus-host 127.0.0.1 --prometheus-port 29000 \
+    2>&1 | tee /tmp/server-R.log | sed -u "s/^/[R] /" &
+
+  wait -n
+  EOF
+
+# The container mounts modelsight at /root/modelsight. ms installs AIPerf in the
+# image; the probe runs it, one run per level, against the router.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_shadow
+  --model Qwen/Qwen3-8B
+  --router http://localhost:8000
+  --router-metrics http://localhost:29000
+  --worker http://localhost:8100
+  --worker http://localhost:8200
+  --log /tmp/server-A.log
+  --log /tmp/server-B.log
+  --log /tmp/server-R.log
+  --levels 8,16,32,64
+  --sessions 128
