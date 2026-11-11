@@ -148,13 +148,18 @@ def shares(counts: dict[str, float]) -> dict[str, float]:
 
 
 def aiperf_command(args: argparse.Namespace, level: int, dataset: Path,
-                   artifacts: Path, turns: int) -> list[str]:  # fmt: skip
+                   artifacts: Path, sessions: int) -> list[str]:  # fmt: skip
     """H5's AIPerf run, sent to the router, replaying every session once.
 
     A level is a fixed amount of work, not a fixed time: AIPerf walks the
-    sessions in file order and stops after `turns` requests, every turn of
-    every session. Under a time limit a loaded level gets through fewer turns
-    per session, so it would send shorter prompts than a light one.
+    sessions in file order and stops once `sessions` of them have completed.
+    Under a time limit a loaded level gets through fewer turns per session, so
+    it would send shorter prompts than a light one.
+
+    The stop is a session count, not a request count. With --request-count
+    AIPerf wraps back to the first session when a slot frees up near the end,
+    and those restarted sessions use up the request budget that the long
+    sessions still needed, so some turns are sent twice and others never.
 
     AIPerf polls <url>/metrics by default. The router forwards that GET to an
     engine like any other request, so every poll would count as a plan with
@@ -166,7 +171,7 @@ def aiperf_command(args: argparse.Namespace, level: int, dataset: Path,
         at = command.index(flag)
         del command[at : at + 2]
     command[command.index("--dataset-sampling-strategy") + 1] = "sequential"
-    return [*command, "--request-count", str(turns), "--no-server-metrics"]
+    return [*command, "--num-sessions", str(sessions), "--no-server-metrics"]
 
 
 def session_turns(sessions: list[list[dict]], render, cap: int,
@@ -268,7 +273,7 @@ def run_level(args: argparse.Namespace, level: int, sessions: list[list[str]],
     if len(sessions) < level:
         print(f"warning: level {level} has only {len(sessions)} sessions, so fewer "
               "than that are ever in flight", flush=True)  # fmt: skip
-    command = aiperf_command(args, level, dataset, out_dir / f"aiperf-{level}", turns)
+    command = aiperf_command(args, level, dataset, out_dir / f"aiperf-{level}", len(sessions))
     before = scrape(args.router_metrics)
     served = [kv.metric_totals(url, h4.REQUEST_METRICS)["served"] for url in args.workers]
     started = time.monotonic()

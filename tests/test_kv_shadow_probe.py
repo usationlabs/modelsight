@@ -234,7 +234,7 @@ def test_aiperf_replays_every_session_once_against_the_router(tmp_path):
     command = shadow.aiperf_command(argv, 16, tmp_path / "s.jsonl", tmp_path / "art", 1234)
 
     for flag, value in (("--url", "http://r"), ("--concurrency", "16"),
-                        ("--request-count", "1234"),
+                        ("--num-sessions", "1234"),
                         ("--dataset-sampling-strategy", "sequential"),
                         ("--custom-dataset-type", "multi_turn")):  # fmt: skip
         assert command[command.index(flag) + 1] == value
@@ -242,6 +242,8 @@ def test_aiperf_replays_every_session_once_against_the_router(tmp_path):
     assert "--benchmark-duration" not in command
     assert "--benchmark-grace-period" not in command
     assert "--no-server-metrics" in command  # its polls would be routed as requests
+    # a request count lets AIPerf restart sessions and cut long ones short
+    assert "--request-count" not in command
 
 
 def test_two_workers_are_required():
