@@ -117,8 +117,10 @@ server: |
   # from /kv_event_sources. With static sources every fetch would end as
   # no_peer_endpoint. Cost constants are H5's (see
   # shadow_kv_transfer_planner_calibrated.yaml).
+  # RUST_LOG adds kv_aware's per-request "KV prefix decision" lines (input and
+  # credited prefix tokens, outcome, worker) to the router logs.
   router() {
-    stdbuf -oL vllm-router \
+    RUST_LOG=info,vllm_router_rs::policies::kv_aware=debug stdbuf -oL vllm-router \
       --host 127.0.0.1 --port $2 \
       --worker-urls http://localhost:8100 http://localhost:8200 \
       --policy kv_aware \

@@ -400,6 +400,11 @@ def smoke_burst(args, servers: Servers, context: list[int], ids: Ids) -> dict:
     found = lookups(h4.log_since(args.logs["B"], b_log), time.localtime().tm_year)
     requests = shadow.by_label(added, REQUESTS, "outcome")
     return {"requests": requests, "plans": shadow.by_label(added, shadow.PLANS, "outcome"),
+            # How the router saw the burst: prefix_cost vs sticky_hit or
+            # missing_tokens, and whether its index found the context (hit)
+            # or not (miss, index_unavailable).
+            "decisions": shadow.by_label(added, shadow.DECISIONS, "outcome"),
+            "placement_lookups": shadow.by_label(added, shadow.LOOKUPS, "result"),
             "hits": sum("hit_tokens" in v for v in found.values()),
             "errors": errors,
             "ok": requests.get("sent", 0) > 0 and not errors}  # fmt: skip
