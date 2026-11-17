@@ -58,8 +58,8 @@ from modelsight.probes import kv_shadow as shadow
 from modelsight.probes import kv_transfer as kv
 from modelsight.probes.kv_transfer import Servers
 
-DEFAULT_CONTEXTS = "8000,32000,64000,128000"
-DEFAULT_RATES = "0.5,1,2,4"
+DEFAULT_CONTEXTS = "8000,16000,24000"
+DEFAULT_RATES = "1,2,4,8"
 ARMS = ("shadow", "active")
 # Most tokens one user or assistant message adds to a session. Kept short so
 # 16 running sessions' turns fit in A's cache next to the contexts.
@@ -641,14 +641,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="shared context lengths in tokens")  # fmt: skip
     parser.add_argument("--rates", default=DEFAULT_RATES,
                         help="session arrivals per second, one sweep step each")  # fmt: skip
-    parser.add_argument("--sessions", type=int, default=120,
+    parser.add_argument("--sessions", type=int, default=240,
                         help="sessions per arm and rate")  # fmt: skip
     parser.add_argument("--turns", type=int, default=4)
     parser.add_argument("--turn-tokens", type=int, default=TURN_TOKENS,
                         help="most tokens one user or assistant message adds")  # fmt: skip
     parser.add_argument("--output-tokens", type=int, default=OUTPUT_TOKENS,
                         help="tokens each sweep turn generates")  # fmt: skip
-    parser.add_argument("--max-model-len", type=int, default=131072)
+    parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--block-size", type=int, default=64)
     parser.add_argument("--traces", default=h4.DEFAULT_DATASET)
     parser.add_argument("--smoke-burst", type=int, default=SMOKE_BURST)
