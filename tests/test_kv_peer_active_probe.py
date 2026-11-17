@@ -213,10 +213,10 @@ def argv(fakes, tmp_path, *extra: str) -> list[str]:
         "--producer-log", str(a.log), "--consumer-log", str(b.log),
         "--router", f"active={routers['active'].url},{routers['active'].url}",
         "--router", f"shadow={routers['shadow'].url},{routers['shadow'].url}",
-        "--contexts", "40,80", "--rates", "50", "--sessions", "4", "--turns", "2",
+        "--contexts", "40,80", "--context-count", "4", "--verify-contexts", "2",
+        "--rates", "50", "--sessions", "4", "--turns", "2",
         "--max-model-len", "1000", "--block-size", str(BLOCK), "--smoke-burst", "4",
-        "--output-tokens", "4", "--traces", str(traces), "--copies", "1",
-        "--min-sends", "1",
+        "--output-tokens", "4", "--traces", str(traces), "--min-sends", "1",
         "--output", str(tmp_path / "out" / "results.json"), *extra,
     ]  # fmt: skip
 
@@ -271,19 +271,20 @@ def test_smoke_only_stops_after_verify(fakes, tmp_path):
     assert active.main(argv(fakes, tmp_path, "--smoke-only")) == 0
 
     result = results(tmp_path)
-    assert set(result["verified"]) == {"40", "80"}
+    # Two sampled contexts spanning the palette's lengths.
+    assert sorted(c["context_tokens"] for c in result["verified"].values()) == [40, 80]
     assert set(result["checks"]) == {"smoke", "verified", "no_leaks"}
     assert routers["shadow"].count == 0
 
 
 def test_contexts_have_exact_lengths_and_share_no_prefix():
     traces = [SESSION, SESSION]
-    contexts = active.build_contexts(encode, traces, [40, 80, 160], copies=2)
+    contexts = active.build_contexts(encode, traces, 4, [40, 80])
 
-    assert {n: [len(c) for c in cs] for n, cs in contexts.items()} == {
-        40: [40, 40], 80: [80, 80], 160: [160, 160]}
-    firsts = {tuple(c[:BLOCK]) for cs in contexts.values() for c in cs}
-    assert len(firsts) == 6
+    assert {n: len(c) for n, c in contexts.items()} == {0: 40, 1: 80, 2: 40, 3: 80}
+    assert contexts[0][:BLOCK] != contexts[1][:BLOCK]
+    # Same length, different index: the header keeps their first blocks apart.
+    assert contexts[0][:BLOCK] != contexts[2][:BLOCK]
 
 
 def test_session_prompts_extend_each_other_and_stop_at_the_window():
@@ -335,25 +336,27 @@ def test_record_problem_matches_the_routers_validation():
 
 def test_a_fetch_slower_than_the_same_request_recomputed_counts_as_lost():
     shadow = [
-        {"id": "pf0000005x", "session": 0, "turn": 0, "context": 8000, "ttft_s": 0.5},
-        {"id": "pf0000006x", "session": 1, "turn": 0, "context": 8000, "ttft_s": 0.5},
+        {"id": "pf0000005x", "session": 0, "turn": 0, "context": 0, "ttft_s": 0.5},
+        {"id": "pf0000006x", "session": 1, "turn": 0, "context": 0, "ttft_s": 0.5},
     ]
-    active_records = [
-        {"id": "pf0000001x", "session": 0, "turn": 0, "context": 8000, "ttft_s": 0.2,
+    records = [
+        {"id": "pf0000001x", "session": 0, "turn": 0, "context": 0, "ttft_s": 0.2,
          "hit_tokens": 7936, "queue_s": 0.05, "reply_s": 0.02, "pull_s": 0.1},
-        {"id": "pf0000002x", "session": 1, "turn": 0, "context": 8000, "ttft_s": 0.9,
+        {"id": "pf0000002x", "session": 1, "turn": 0, "context": 0, "ttft_s": 0.9,
          "hit_tokens": 7936, "queue_s": 0.6, "reply_s": 0.2, "pull_s": 0.1},
-        {"id": "pf0000003x", "session": 2, "turn": 0, "context": 8000, "ttft_s": 0.5,
+        {"id": "pf0000003x", "session": 2, "turn": 0, "context": 0, "ttft_s": 0.5,
          "miss": "evicted"},
-        {"id": "pf0000004x", "session": 3, "turn": 0, "context": 8000, "error": "boom"},
+        {"id": "pf0000004x", "session": 3, "turn": 0, "context": 0, "error": "boom"},
     ]  # fmt: skip
-    verified = {8000: {"recompute": {"ttft_s": 0.6}}}
+    verified = {0: {"context_tokens": 8000, "recompute": {"ttft_s": 0.6}}}
+    length_of = {0: 8000}
 
-    summary = active.summarize_arm({"records": active_records})
+    summary = active.summarize_arm({"records": records}, length_of)
     comparison = active.compare({"shadow": {"records": shadow},
-                                 "active": {"records": active_records}}, verified)
+                                 "active": {"records": records}}, verified, length_of)  # fmt: skip
 
     assert summary["fetches"] == 2
     assert summary["misses"] == {"evicted": 1}
+    assert summary["errors"] == 1
     assert (comparison["paired"], comparison["won"], comparison["lost"]) == (2, 1, 1)
     assert comparison["pull_beats_idle_recompute"] == 2
