@@ -33,7 +33,7 @@ sources:
 secrets: [HF_TOKEN]
 
 cache:
-  prefetch: [Qwen/Qwen3-8B]
+  prefetch: [meta-llama/Llama-3.1-8B-Instruct]
 
 ready_url: http://localhost:8000/health
 ready_timeout: 25m
@@ -80,23 +80,21 @@ server: |
   JSON
   export VLLM_LOGGING_CONFIG_PATH=/tmp/vllm-logging.json
 
-  # --hf-overrides / --max-model-len 131072: YaRN, factor 4, for 128k-token
-  #   contexts (Qwen3-8B is 32k natively). This vLLM takes `rope_parameters`
-  #   (with Qwen3's rope_theta), not `rope_scaling`; see
-  #   docs/features/context_extension.md. Same on both engines, so their KV
-  #   layouts match.
+  # Llama-3.1-8B-Instruct: 128k context natively and full attention, which the
+  #   peer pin needs. Qwen3-8B is 32k natively and needs YaRN for 128k contexts;
+  #   this vLLM would not take the override (derived max_model_len stayed 40960).
+  #   Gated: HF_TOKEN's account must have accepted the Llama 3.1 licence.
   # --block-size 64: the same on both engines; the router reads it from them.
   # --max-num-seqs 16: H5's running limit, so sessions beyond it queue.
   # --max-num-batched-tokens 8192: chunked prefill, so a 128k prefill on A is
   #   many short steps and a lookup waits one or two of them, not all of it.
   # --enable-scale-out serves the render endpoints the router reads prompts with.
   # peer_pin_max_fraction 0.5: A may pin half its cache, so a 128k prefix is
-  #   pinned whole (the default 0.25 is about 88k tokens here).
+  #   pinned whole (the default 0.25 is about 100k tokens here).
   serve() {
-    CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL vllm serve Qwen/Qwen3-8B \
+    CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL vllm serve meta-llama/Llama-3.1-8B-Instruct \
       --port $3 \
       --max-model-len 131072 \
-      --hf-overrides '{"rope_parameters": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768, "rope_theta": 1000000}}' \
       --gpu-memory-utilization 0.9 \
       --block-size 64 \
       --max-num-seqs 16 \
@@ -120,7 +118,8 @@ server: |
   # is the only way it reads the engine's peer_lookup record (A's NIXL address)
   # from /kv_event_sources. With static sources every fetch would end as
   # no_peer_endpoint. Cost constants are H5's (see
-  # shadow_kv_transfer_planner_calibrated.yaml).
+  # shadow_kv_transfer_planner_calibrated.yaml), measured on Qwen3-8B; Llama-3.1-8B
+  # is a similar size, so they are a starting point, not a calibration.
   router() {
     stdbuf -oL vllm-router \
       --host 127.0.0.1 --port $2 \
@@ -143,7 +142,7 @@ server: |
 # the smoke and verify stages, for a short first run.
 bench: >-
   PYTHONPATH=/root python -m modelsight.probes.kv_peer_active
-  --model Qwen/Qwen3-8B
+  --model meta-llama/Llama-3.1-8B-Instruct
   --producer http://localhost:8100
   --consumer http://localhost:8200
   --producer-log /tmp/server-A.log
