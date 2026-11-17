@@ -247,7 +247,7 @@ def test_full_run_passes_every_check(fakes, tmp_path):
                            for r in sweep[arm]["records"]) for arm in active.ARMS}
     assert prompts["active"] == prompts["shadow"]
     comparison = result["comparison"]["50.0"]
-    assert comparison["fetches"] == comparison["paired"] > 0
+    assert comparison["fetches"] == comparison["pairs"] > 0
     assert all("cached_tokens" in r for r in sweep["shadow"]["records"])
 
 
@@ -367,6 +367,8 @@ def test_a_fetch_slower_than_the_same_request_recomputed_counts_as_lost():
     assert summary["fetches"] == 2
     assert summary["misses"] == {"evicted": 1}
     assert summary["errors"] == 1
-    assert (comparison["paired"], comparison["won"], comparison["lost"]) == (2, 1, 1)
-    assert comparison["lost_to_cache_hit"] == 1
+    assert (comparison["pairs"], comparison["won"], comparison["lost"]) == (2, 1, 1)
+    # Session 0's shadow request reported no cache, session 1's had the context.
+    assert comparison["by_kind"]["unknown"][8000]["won"] == 1
+    assert comparison["by_kind"]["cache_hit"][8000]["lost"] == 1
     assert comparison["pull_beats_idle_recompute"] == 2

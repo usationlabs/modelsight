@@ -645,21 +645,47 @@ def summarize_arm(result: dict, length_of: dict[int, int]) -> dict:
     }
 
 
+def shadow_kind(twin: dict, hit_tokens: int) -> str:
+    """What the same request did in the shadow run: "recompute" if its engine
+    had less than half of the pulled prefix cached, "cache_hit" if it had at
+    least half, "unknown" if the engine did not report cached tokens."""
+    cached = twin.get("cached_tokens")
+    if cached is None:
+        return "unknown"
+    return "cache_hit" if 2 * cached >= hit_tokens else "recompute"
+
+
+def _pair_stats(pairs: list[tuple[dict, float]]) -> dict:
+    return {
+        "pairs": len(pairs),
+        "ttft_pulled": _quantiles([r["ttft_s"] for r, _ in pairs]),
+        "ttft_shadow": _quantiles([s for _, s in pairs]),
+        "saved_s": _quantiles([s - r["ttft_s"] for r, s in pairs]),
+        "won": sum(r["ttft_s"] < s for r, s in pairs),
+        "lost": sum(r["ttft_s"] >= s for r, s in pairs),
+    }
+
+
 def compare(by_arm: dict[str, dict], verified: dict, length_of: dict[int, int]) -> dict:
-    """Pull against recompute, at one rate.
+    """Pulls against the same requests in the shadow run, at one rate.
 
     Each fetched request in the active arm is paired with the same session's
     same turn in the shadow arm, which arrived at the same time under the same
-    load and was recomputed. A fetch lost if its pair got its first token
-    sooner. The idle verify numbers show the pull and compute alone.
+    load. In shadow that request either recomputed the prefix or found it
+    cached (often on A, behind A's queue); the pairs are split by which, and
+    by context length. The idle verify numbers show the pull and compute alone.
     """
     twins = {(r["session"], r["turn"]): r
              for r in by_arm["shadow"]["records"] if "error" not in r}  # fmt: skip
-    shadow_ttft = {key: r["ttft_s"] for key, r in twins.items()}
     fetched = [r for r in by_arm["active"]["records"]
                if "hit_tokens" in r and "error" not in r]  # fmt: skip
-    pairs = [(r, shadow_ttft[(r["session"], r["turn"])]) for r in fetched
-             if (r["session"], r["turn"]) in shadow_ttft]  # fmt: skip
+    pairs = [(r, twins[(r["session"], r["turn"])]) for r in fetched
+             if (r["session"], r["turn"]) in twins]  # fmt: skip
+    groups: dict[str, dict[int, list[tuple[dict, float]]]] = {}
+    for r, twin in pairs:
+        kind = shadow_kind(twin, r["hit_tokens"])
+        length = length_of.get(r["context"], 0)
+        groups.setdefault(kind, {}).setdefault(length, []).append((r, twin["ttft_s"]))
     idle = {c["context_tokens"]: c["recompute"]["ttft_s"] for c in verified.values()}
     pulled = [(r, idle[length_of[r["context"]]]) for r in fetched
               if "pull_s" in r and length_of.get(r["context"]) in idle]  # fmt: skip
@@ -669,19 +695,10 @@ def compare(by_arm: dict[str, dict], verified: dict, length_of: dict[int, int]) 
 
     return {
         "fetches": len(fetched),
-        "paired": len(pairs),
-        "ttft_pulled": _quantiles([r["ttft_s"] for r, _ in pairs]),
-        "ttft_recomputed": _quantiles([s for _, s in pairs]),
-        "saved_s": _quantiles([s - r["ttft_s"] for r, s in pairs]),
-        "won": sum(r["ttft_s"] < s for r, s in pairs),
-        "lost": sum(r["ttft_s"] >= s for r, s in pairs),
-        # Losses whose shadow twin found the prefix in its engine's own cache:
-        # the shadow run happened to route it to an engine that held the
-        # context, so the twin was a cache hit, not a recompute.
-        "lost_to_cache_hit": sum(
-            r["ttft_s"] >= s
-            and twins[(r["session"], r["turn"])].get("cached_tokens", 0) >= r["hit_tokens"]
-            for r, s in pairs),
+        **_pair_stats([(r, twin["ttft_s"]) for r, twin in pairs]),
+        "by_kind": {kind: {length: _pair_stats(group)
+                           for length, group in sorted(by_length.items())}
+                    for kind, by_length in sorted(groups.items())},
         "queue_s": times("queue_s"),
         "reply_s": times("reply_s"),
         "pull_s": times("pull_s"),
@@ -764,17 +781,26 @@ def print_summary(verified: dict, sweep: dict, comparison: dict, checks: dict) -
                   f"{info['served']['A']:.0f}/{info['served']['B']:.0f}  "
                   f"{r['requests'].get('sent', 0):>4.0f}  {summary['fetches']:>7}  {ttft}")
     if comparison:
-        print("under load: each fetched request vs the same request recomputed in "
-              "the shadow arm (p50 seconds)")  # fmt: skip
-        print("rate    paired  pulled_ttft  recomputed_ttft  saved  won/lost  "
-              "lost_to_hit  B_queue  A_reply  pull+compute  beats_idle_recompute")  # fmt: skip
+        print("under load: where each fetch's time went (p50 seconds)")
+        print("rate    fetches  won/lost  B_queue  A_reply  pull+compute  "
+              "beats_idle_recompute")  # fmt: skip
     for rate, c in comparison.items():
-        print(f"{rate:<7} {c['paired']:>6}  {_s(c['ttft_pulled']['p50']):>11}  "
-              f"{_s(c['ttft_recomputed']['p50']):>15}  {_s(c['saved_s']['p50']):>5}  "
-              f"{c['won']:>4}/{c['lost']:<4} {c['lost_to_cache_hit']:>11}  "
-              f"{_s(c['queue_s']['p50']):>7}  "
-              f"{_s(c['reply_s']['p50']):>7}  {_s(c['pull_s']['p50']):>12}  "
+        print(f"{rate:<7} {c['fetches']:>7}  {c['won']:>4}/{c['lost']:<4} "
+              f"{_s(c['queue_s']['p50']):>7}  {_s(c['reply_s']['p50']):>7}  "
+              f"{_s(c['pull_s']['p50']):>12}  "
               f"{c['pull_beats_idle_recompute']}/{c['pulled_with_times']}")  # fmt: skip
+    if comparison:
+        print("under load: each fetch vs the same request in shadow, by what shadow "
+              "did (p50 seconds)")  # fmt: skip
+        print("rate    shadow did  context  pairs  pulled_ttft  shadow_ttft  saved  "
+              "won/lost")  # fmt: skip
+    for rate, c in comparison.items():
+        for kind, by_length in c["by_kind"].items():
+            for length, g in by_length.items():
+                print(f"{rate:<7} {kind:<10}  {length:>7}  {g['pairs']:>5}  "
+                      f"{_s(g['ttft_pulled']['p50']):>11}  "
+                      f"{_s(g['ttft_shadow']['p50']):>11}  {_s(g['saved_s']['p50']):>5}  "
+                      f"{g['won']:>4}/{g['lost']}")  # fmt: skip
     for name, result in checks.items():
         print(f"{'PASS' if result['ok'] else 'FAIL'}  {name}")
 
