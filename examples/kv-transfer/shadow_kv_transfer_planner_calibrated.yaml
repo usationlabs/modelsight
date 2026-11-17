@@ -1,0 +1,140 @@
+# Run 1 of the shadow planner, redone at level 64 with the H5-calibrated constants.
+#
+# shadow_kv_transfer_planner.yaml ran the router's shadow transfer planner with its
+# placeholder cost constants at N = 8, 16, 32 and 64. Only at N = 64, where both engines
+# run 16 requests and queue, did the planner plan much (154 of 2945 requests). Those
+# plans used a 5 ms fixed fetch cost, 5 us per token to transfer and 50 us per token to
+# prefill, and H5 measured different numbers. This experiment asks how many of run 1's
+# level-64 plans survive realistic costs.
+#
+# Everything else is as in run 1: the same 128 agent sessions (2945 turns) sent in full,
+# with 64 in flight at once, on two engines that each run at most 16 requests, with the
+# router in kv_aware and --kv-transfer-mode shadow, which counts what it would do and
+# changes nothing. Only the three cost constants differ, and the router is pinned to the
+# commit run 1 used, so the constants are the only change. The probe reads what the level
+# added to the router's metrics:
+#
+#   outcomes   planned, or why not (no_peer, source_not_busy, cost_rule, ...)
+#   estimates  fetch and wait cost, and saved time, from the planner's histograms
+#   inputs     how many requests the router could tokenize and identify
+#   load       A's and B's running and waiting requests
+#
+# Level 64 took about 20 minutes in run 1. With the image build and the engines'
+# startup, expect 30 to 40 minutes in all.
+#
+# Prepare once, with no GPU:  uv run ms build -f examples/kv-transfer/shadow_kv_transfer_planner_calibrated.yaml
+# Run, with streamed logs:    uv run ms run -f examples/kv-transfer/shadow_kv_transfer_planner_calibrated.yaml --detach
+target: modal
+gpu: A100-80GB:2
+dockerfile: Dockerfile.shadow_kv_transfer_planner
+sources:
+  # Shadow mode needs no engine change. This branch keeps the vLLM of H4 and H5,
+  # so their numbers apply, and it serves the render endpoints the router
+  # tokenizes chat requests with.
+  VLLM:
+    repo: https://github.com/usationlabs/vllm
+    ref: feat/nixl-peer-lookup-pin
+  # Pinned to the commit run 1 used, so only the constants below differ from it. The
+  # branch feat/peer-kv-fetch has moved on since.
+  ROUTER:
+    repo: https://github.com/usationlabs/router
+    ref: c2c010a084b3c9fb9f6f707505b0bc6b03c562ab
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [Qwen/Qwen3-8B]
+
+ready_url: http://localhost:8000/health
+ready_timeout: 20m
+timeout: 60m
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|torch) '
+  - vllm-router --version || true
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+
+# Lines are tagged [A], [B] or [R]. The router starts once both engines are
+# healthy, and the run stops if any of the three exits.
+server: |
+  bash <<'EOF'
+  # VLLM_SERVER_DEV_MODE exposes /reset_prefix_cache, which the probe calls
+  # between levels so each one starts cold.
+  export VLLM_SERVER_DEV_MODE=1
+
+  # --enable-scale-out serves /v1/chat/completions/render, which the router
+  # calls to get each request's token ids; without it every request is
+  # missing_tokens. --block-size 16 must match --kv-event-block-size below.
+  # --max-num-seqs 16 is H5's running limit (kv_peer_load.A_MAX_SEQS).
+  serve() {
+    CUDA_VISIBLE_DEVICES=$2 stdbuf -oL vllm serve Qwen/Qwen3-8B \
+      --port $3 \
+      --max-model-len 32768 \
+      --gpu-memory-utilization 0.9 \
+      --block-size 16 \
+      --max-num-seqs 16 \
+      --enable-prefix-caching \
+      --enable-scale-out \
+      --kv-events-config "{\"enable_kv_cache_events\": true, \"publisher\": \"zmq\", \"endpoint\": \"tcp://*:$4\", \"replay_endpoint\": \"tcp://*:$5\"}" \
+      2>&1 | tee /tmp/server-$1.log | sed -u "s/^/[$1] /"
+  }
+
+  serve A 0 8100 5557 5558 &
+  serve B 1 8200 5567 5568 &
+
+  until curl -sf localhost:8100/health && curl -sf localhost:8200/health; do
+    sleep 5
+  done
+
+  # The engines' KV event endpoints are given statically: the router's HTTP
+  # discovery does not read vLLM's model and block size (plan D.1), and both
+  # engines need the same --kv-event-model to share a cache identity, or every
+  # request is no_peer. The planner's margin, minimum prefix and source load threshold
+  # are left at their defaults (0.8, 64 blocks, 1 request).
+  #
+  # The three cost constants come from H5 (modelsight PR #7, run h5-20261109-130046),
+  # not from the router's placeholders:
+  #   --kv-transfer-fixed-ms 106
+  #       Median peer lookup at N = 64: from B's first scheduling attempt to the
+  #       "Peer lookup_pin hit" line. Lookup took about 110 ms from N = 8 to N = 64
+  #       and 37 ms on an idle engine. Run 1 used 5 ms.
+  #   --kv-transfer-us-per-token 3.3
+  #       The copy took 0.03 to 0.09 s for a 26.9k-token prefix. 0.09 s / 26.9k is
+  #       about 3.3 us per token, the slow end, so the estimate is conservative.
+  #       Run 1 used 5 us.
+  #   --kv-transfer-prefill-us-per-token 78
+  #       Recomputing the same 26.9k-token prompt on B took about 2.1 s.
+  #       2.1 s / 26.9k is about 78 us per token. Run 1 used 50 us.
+  stdbuf -oL vllm-router \
+    --host 127.0.0.1 --port 8000 \
+    --worker-urls http://localhost:8100 http://localhost:8200 \
+    --policy kv_aware \
+    --kv-event-source http://localhost:8100=tcp://localhost:5557 \
+    --kv-event-source http://localhost:8200=tcp://localhost:5567 \
+    --kv-event-replay-source http://localhost:8100=tcp://localhost:5558 \
+    --kv-event-replay-source http://localhost:8200=tcp://localhost:5568 \
+    --kv-event-model Qwen/Qwen3-8B \
+    --kv-event-block-size 16 \
+    --kv-transfer-mode shadow \
+    --kv-transfer-fixed-ms 106 \
+    --kv-transfer-us-per-token 3.3 \
+    --kv-transfer-prefill-us-per-token 78 \
+    --prometheus-host 127.0.0.1 --prometheus-port 29000 \
+    2>&1 | tee /tmp/server-R.log | sed -u "s/^/[R] /" &
+
+  wait -n
+  EOF
+
+# The container mounts modelsight at /root/modelsight. ms installs AIPerf in the
+# image; the probe runs it, one run per level, against the router.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_shadow
+  --model Qwen/Qwen3-8B
+  --router http://localhost:8000
+  --router-metrics http://localhost:29000
+  --worker http://localhost:8100
+  --worker http://localhost:8200
+  --log /tmp/server-A.log
+  --log /tmp/server-B.log
+  --log /tmp/server-R.log
+  --levels 64
+  --sessions 128

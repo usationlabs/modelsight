@@ -17,7 +17,7 @@ from pathlib import Path
 
 import modal
 
-from modelsight.build import BuildError, Prepared, prepare
+from modelsight.build import BuildError, Prepared, prepare, render_dockerfile
 from modelsight.config import Experiment
 from modelsight.runner import MODAL_TIMEOUT_BUFFER_SECONDS, RunError
 from modelsight.runs import RunState, save_state
@@ -28,6 +28,7 @@ HF_SECRET = "huggingface"
 APP_NAME = "modelsight"
 # Downloading a large checkpoint takes a while; this only caps a hung download.
 PREFETCH_TIMEOUT_SECONDS = 4 * 3600
+RENDERED_DOCKERFILES = Path.home() / ".cache" / "modelsight" / "dockerfiles"
 
 
 def _local_secret(names: tuple[str, ...]) -> modal.Secret:
@@ -47,8 +48,12 @@ def build_image(exp: Experiment, prepared: Prepared) -> modal.Image:
     caches each layer."""
     if exp.dockerfile:
         dockerfile = Path(exp.dockerfile)
+        rendered = render_dockerfile(dockerfile.read_text(), prepared.build_args)
+        RENDERED_DOCKERFILES.mkdir(parents=True, exist_ok=True)
+        path = RENDERED_DOCKERFILES / f"{prepared.fingerprint}.Dockerfile"
+        path.write_text(rendered)
         image = modal.Image.from_dockerfile(
-            dockerfile,
+            path,
             context_dir=dockerfile.parent,
             build_args=dict(prepared.build_args),
             add_python=exp.add_python,

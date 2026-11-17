@@ -73,11 +73,11 @@ def wait_ready(url: str, timeout: float = READY_TIMEOUT_SECONDS) -> None:
             time.sleep(1)
 
 
-def post(servers: Servers, url: str, body: dict):
+def post(servers: Servers, url: str, body: dict, headers: dict | None = None):
     request = urllib.request.Request(
         f"{url}/v1/completions",
         data=json.dumps({"model": servers.model, "temperature": 0, **body}).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
     )
     return urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS)
 
@@ -135,9 +135,13 @@ def warm(servers: Servers, prompt: list[int]) -> dict:
     return {**timing, "hit_fraction": (after - before) / len(prompt)}
 
 
-def prefill(servers: Servers, prompt: list[int]) -> dict:
-    """Have the producer compute a prompt and hold its blocks for a reader."""
+def prefill(servers: Servers, prompt: list[int], **extra) -> dict:
+    """Have the producer compute a prompt and hold its blocks for a reader.
+
+    `extra` fields (a cache_salt, say) go into the request body.
+    """
     body = {
+        **extra,
         "prompt": prompt,
         "stream": False,
         "max_tokens": 1,

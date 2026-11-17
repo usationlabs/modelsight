@@ -1,0 +1,164 @@
+# End to end peer KV fetch through the router, on two GPUs.
+#
+# The whole flow runs on a real engine pair: the router (kv_aware) picks a
+# destination, its transfer planner picks a source and checks the cost rule,
+# the router sends the request to B with A's side-channel address, B asks A
+# for the prefix by block hash, A pins it and replies, B pulls the KV over
+# NIXL and computes the rest.
+#
+# Two routers sit in front of the same engines and differ only in
+# --kv-transfer-mode: shadow (port 8001, the baseline: requests go out
+# unchanged) and active (port 8000). The probe runs the same sessions, with the
+# same arrival times, through each in turn. See probes/kv_peer_active.py for the
+# stages (smoke, verify, sweep) and the checks.
+#
+# Load: 15 shared contexts, 3 each of 8k, 14k, 20k, 26k and 30k tokens (about
+# 294k), are put in A's cache before each arm. Sessions start at a fixed rate,
+# each on one context with short turns, so cache affinity keeps them on A.
+# Concurrency fills A's 16 slots and builds its queue. A context's first
+# request on B is a fetch opportunity. Rates stay between 1.25 and 2, where A
+# queues and B still has room. Each fetched request is compared with the same
+# request in the shadow arm; --enable-prompt-tokens-details reports whether
+# that twin was a cache hit instead of a recompute.
+#
+# Prepare once, with no GPU:  uv run ms build -f examples/kv-transfer/peer_fetch_active.yaml
+# Run, with streamed logs:    uv run ms run -f examples/kv-transfer/peer_fetch_active.yaml --detach
+target: modal
+gpu: A100-80GB:2
+dockerfile: Dockerfile.shadow_kv_transfer_planner
+sources:
+  VLLM:
+    repo: https://github.com/usationlabs/vllm
+    ref: feat/nixl-peer-lookup-pin
+  # router PR vllm-project/router#509. Active mode needs the engine's
+  # peer_lookup record, which the router reads from /kv_event_sources.
+  ROUTER:
+    repo: https://github.com/usationlabs/router
+    ref: feat/peer-kv-fetch
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [Qwen/Qwen3-8B]
+
+ready_url: http://localhost:8000/health
+ready_timeout: 25m
+timeout: 150m
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch) '
+  - vllm-router --version || true
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - nvidia-smi nvlink --status
+
+# Lines are tagged [A], [B], [RA] (active router) or [RS] (shadow router). The
+# routers start once both engines are healthy; the run stops if any exits.
+server: |
+  bash <<'EOF'
+  export PYTHONPATH=/opt/nixl-error-mode
+  # /reset_prefix_cache (the probe resets between arms) and /server_info, which
+  # the router's discovery reads the block size from.
+  export VLLM_SERVER_DEV_MODE=1
+  # Block hashes must be the same on A and B, so B can look its prompt up on A.
+  export PYTHONHASHSEED=0
+  # UCX_PROTO_INFO prints the transport of B's KV reads; the smoke check
+  # requires cuda_ipc.
+  export UCX_RCACHE_MAX_UNRELEASED=1024 UCX_PROTO_INFO=y
+
+  # The peer lookup modules log at DEBUG: B's log has a line per lookup result
+  # ("Peer lookup_pin hit for <id>" or "Peer lookup for <id> missed"), which
+  # the probe matches to its requests by X-Request-Id.
+  cat > /tmp/vllm-logging.json <<'JSON'
+  {
+    "version": 1,
+    "disable_existing_loggers": false,
+    "formatters": {"vllm": {"()": "vllm.logging_utils.NewLineFormatter",
+      "datefmt": "%m-%d %H:%M:%S",
+      "format": "(%(vllm_process_name)s pid=%(process)d) %(levelname)s %(asctime)s.%(msecs)03d [%(fileinfo)s:%(lineno)d] %(message)s"}},
+    "handlers": {"vllm": {"class": "logging.StreamHandler", "formatter": "vllm",
+      "level": "DEBUG", "stream": "ext://sys.stdout"}},
+    "loggers": {
+      "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": false},
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.peer_pins": {"level": "DEBUG"},
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler": {"level": "DEBUG"}
+    }
+  }
+  JSON
+  export VLLM_LOGGING_CONFIG_PATH=/tmp/vllm-logging.json
+
+  # Qwen3-8B, as in H4, H5 and the shadow runs, so their numbers and the cost
+  #   constants below apply. Contexts stay under its 32k window; A's queue
+  #   comes from concurrency, not from long prompts.
+  # --block-size 64: the same on both engines; the router reads it from them.
+  # --max-num-seqs 16: H5's running limit, so sessions beyond it queue.
+  # --max-num-batched-tokens 8192: chunked prefill, so a long prefill on A is
+  #   many short steps and a lookup waits one or two of them, not all of it.
+  # --enable-scale-out serves the render endpoints the router reads prompts with.
+  serve() {
+    CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL vllm serve Qwen/Qwen3-8B \
+      --port $3 \
+      --max-model-len 32768 \
+      --gpu-memory-utilization 0.9 \
+      --block-size 64 \
+      --max-num-seqs 16 \
+      --max-num-batched-tokens 8192 \
+      --enable-prefix-caching \
+      --enable-prompt-tokens-details \
+      --prefix-caching-hash-algo sha256 \
+      --enable-scale-out \
+      --kv-events-config "{\"enable_kv_cache_events\": true, \"publisher\": \"zmq\", \"endpoint\": \"tcp://*:$5\", \"replay_endpoint\": \"tcp://*:$6\"}" \
+      --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"peer_lookup":true}}' \
+      2>&1 | tee /tmp/server-$1.log | sed -u "s/^/[$1] /"
+  }
+
+  serve A 0 8100 5600 5557 5558 &
+  serve B 1 8200 5601 5567 5568 &
+
+  until curl -sf localhost:8100/health && curl -sf localhost:8200/health; do
+    sleep 5
+  done
+
+  # No --kv-event-source flags: the router discovers each engine itself, which
+  # is the only way it reads the engine's peer_lookup record (A's NIXL address)
+  # from /kv_event_sources. With static sources every fetch would end as
+  # no_peer_endpoint. Cost constants are H5's (see
+  # shadow_kv_transfer_planner_calibrated.yaml).
+  # RUST_LOG adds kv_aware's per-request "KV prefix decision" lines (input and
+  # credited prefix tokens, outcome, worker) to the router logs.
+  router() {
+    RUST_LOG=info,vllm_router_rs::policies::kv_aware=debug stdbuf -oL vllm-router \
+      --host 127.0.0.1 --port $2 \
+      --worker-urls http://localhost:8100 http://localhost:8200 \
+      --policy kv_aware \
+      --kv-transfer-mode $4 \
+      --kv-transfer-fixed-ms 106 \
+      --kv-transfer-us-per-token 3.3 \
+      --kv-transfer-prefill-us-per-token 78 \
+      --prometheus-host 127.0.0.1 --prometheus-port $3 \
+      2>&1 | tee /tmp/server-$1.log | sed -u "s/^/[$1] /" &
+  }
+  router RS 8001 29001 shadow
+  router RA 8000 29000 active
+
+  wait -n
+  EOF
+
+# The container mounts modelsight at /root/modelsight. --smoke-only stops after
+# the smoke and verify stages, for a short first run.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_peer_active
+  --model Qwen/Qwen3-8B
+  --producer http://localhost:8100
+  --consumer http://localhost:8200
+  --producer-log /tmp/server-A.log
+  --consumer-log /tmp/server-B.log
+  --router active=http://localhost:8000,http://localhost:29000
+  --router shadow=http://localhost:8001,http://localhost:29001
+  --log /tmp/server-RA.log
+  --log /tmp/server-RS.log
+  --max-model-len 32768
+  --contexts 8000,14000,20000,26000,30000
+  --context-count 15
+  --verify-contexts 4
+  --min-sends 5
+  --rates 1.25,1.5,1.75,2
+  --sessions 240
