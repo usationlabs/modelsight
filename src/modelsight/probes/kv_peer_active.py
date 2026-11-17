@@ -259,10 +259,27 @@ def step_seconds(url: str, before: dict[str, float]) -> float | None:
     return (after["sum"] - before["sum"]) / count if count > 0 else None
 
 
-def reset_all(urls: list[str]) -> bool:
-    return all(h5.wait_idle(url) for url in urls) and all(
+def reset_all(servers: Servers) -> bool:
+    urls = [servers.producer, servers.consumer]
+    if not all(h5.wait_idle(url) for url in urls) or not all(
         h4.reset_cache(url) for url in urls
-    )
+    ):
+        return False
+    # vLLM publishes KV events only from a scheduler step, and an idle engine
+    # takes none, so a reset's AllBlocksCleared sits unpublished until the next
+    # request reaches that engine. One tiny one per engine flushes it: without
+    # this, the router's index keeps crediting a cleared engine with blocks it
+    # cached before the reset, and no plan ever wants a fetch from it. Eight
+    # tokens complete no 64-token block, so the tickle itself stores nothing.
+    tickle = {"prompt": kv.fresh_prompt(random.Random("reset-tickle"), 8),
+              "max_tokens": 1}  # fmt: skip
+    try:
+        for url in urls:
+            with kv.post(servers, url, tickle):
+                pass
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 # Requests ---------------------------------------------------------------------
@@ -321,11 +338,10 @@ def run_session(servers: Servers, url: str, session: dict, ids: Ids,
 def peer_case(args, servers: Servers, context: list[int], prompt: list[int],
               params: dict, ids: Ids) -> dict:  # fmt: skip
     """B's recompute and B's direct peer pull of one prompt whose context A holds."""
-    urls = [servers.producer, servers.consumer]
-    if not reset_all(urls):
+    if not reset_all(servers):
         raise RuntimeError("an engine refused to reset its prefix cache")
     recompute = h4.greedy(servers, servers.consumer, {"prompt": prompt})
-    if not reset_all(urls):
+    if not reset_all(servers):
         raise RuntimeError("an engine refused to reset its prefix cache")
     kv.timed_stream(servers, servers.producer, {"prompt": context})
     time.sleep(kv.METRICS_WAIT_SECONDS)
@@ -373,7 +389,7 @@ def smoke_burst(args, servers: Servers, context: list[int], ids: Ids) -> dict:
     """Concurrent requests on one context through the active router, after A
     holds it: cache affinity sends the first to A, and once A is busy the
     router should pick B for some and send them with a fetch from A."""
-    if not reset_all([servers.producer, servers.consumer]):
+    if not reset_all(servers):
         raise RuntimeError("an engine refused to reset its prefix cache")
     kv.timed_stream(servers, servers.producer, {"prompt": context})
     time.sleep(kv.METRICS_WAIT_SECONDS)
@@ -471,7 +487,7 @@ def run_arm(args, servers: Servers, arm: str, rate: float, sessions: list[dict],
             contexts, ids: Ids) -> dict:  # fmt: skip
     urls = [servers.producer, servers.consumer]
     info: dict = {"arm": arm, "rate": rate, "sessions": len(sessions)}
-    info["reset"] = reset_all(urls)
+    info["reset"] = reset_all(servers)
     warm(servers, contexts)
     # Let the KV events of the warm-up reach the router's index.
     time.sleep(kv.METRICS_WAIT_SECONDS)
@@ -741,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
                               "fetches": result["summary"]["fetches"],
                               "load": result["info"]["load"]}), flush=True)  # fmt: skip
 
-    leak_free = reset_all([servers.producer, servers.consumer])
+    leak_free = reset_all(servers)
     checks = check(smoke_result, verified, sweep, leak_free)
     finish({"contexts": lengths, "sessions": len(sessions),
             "smoke": smoke_result, "verified": verified,
