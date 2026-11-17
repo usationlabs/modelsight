@@ -12,10 +12,13 @@
 # same arrival times, through each in turn. See probes/kv_peer_active.py for the
 # stages (smoke, verify, sweep) and the checks.
 #
-# Load: shared contexts (8k, 16k, 24k tokens) are put in A's cache before each
-# arm. Sessions start at a fixed rate, each on one context with short turns, so
-# cache affinity keeps them on A. Concurrency, not prompt length, fills A's 16
-# slots and builds its queue: at the higher rates about 60 sessions are in flight.
+# Load: 18 shared contexts (6 each of 8k, 16k and 24k tokens, 288k in all) are
+# put in A's cache before each arm. Sessions start at a fixed rate, each on one
+# context with short turns, so cache affinity keeps them on A. B fetches on its
+# first request for a context, so more contexts give more fetches. Rates sit
+# between 1 (neither engine queues) and 2 (both full), where A queues and B has
+# room. Each fetched request is compared with the same request recomputed in
+# the shadow arm.
 #
 # Prepare once, with no GPU:  uv run ms build -f examples/kv-transfer/peer_fetch_active.yaml
 # Run, with streamed logs:    uv run ms run -f examples/kv-transfer/peer_fetch_active.yaml --detach
@@ -152,5 +155,7 @@ bench: >-
   --log /tmp/server-RS.log
   --max-model-len 32768
   --contexts 8000,16000,24000
-  --rates 1,2,4,8
+  --copies 6
+  --rates 1.2,1.4,1.6,1.8
+  --min-sends 10
   --sessions 240

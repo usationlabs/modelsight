@@ -23,14 +23,17 @@ Stages, in order. A failing smoke check stops the run before any load.
             ends in at least one `sent`
   verify    for every context length: B's greedy output after a direct peer
             pull matches its own recompute, A serves nothing, B pulls bytes.
-            B's recompute TTFT per length is the baseline a fetch must beat.
+            Idle B's recompute and pull TTFT per length.
   sweep     shared-context sessions arrive at a fixed rate (Poisson), each
             session's turns back to back, all through one router; the same
-            sessions and arrival times run under shadow, then active
+            sessions and arrival times run under shadow, then active. Each
+            fetched request is compared with the same request in the shadow
+            arm, recomputed under the same load.
 
-Load model: a few long shared contexts sit in A's cache before each arm. Every
-session starts with one of them and adds short turns, so cache affinity keeps
-sending sessions to A, A's queue grows with the rate, and B takes the overflow.
+Load model: shared contexts (several per length) sit in A's cache before each
+arm. Every session starts with one of them and adds short turns, so cache
+affinity keeps sending sessions to A, A's queue grows with the rate, and B
+takes the overflow. B fetches on its first request for a context.
 
 Writes results.json to the current directory and exits with status 1 if a
 check fails.
@@ -59,7 +62,17 @@ from modelsight.probes import kv_transfer as kv
 from modelsight.probes.kv_transfer import Servers
 
 DEFAULT_CONTEXTS = "8000,16000,24000"
-DEFAULT_RATES = "1,2,4,8"
+# Session arrivals per second. At 1 neither engine queued; from 2 up both were
+# full with long queues. Peer fetch can only help in between, where A queues
+# and B has free slots.
+DEFAULT_RATES = "1.2,1.4,1.6,1.8"
+# Contexts per length. A fetch happens only on B's first request for a context
+# A holds; after that B holds it too. More contexts, more first requests: 6
+# copies of 8k, 16k and 24k are 288k tokens, under A's ~398k-token pool.
+DEFAULT_COPIES = 6
+# Fewest fetches the active arm must send at each rate for the comparison with
+# recompute to mean anything.
+MIN_SENDS = 10
 ARMS = ("shadow", "active")
 # Most tokens one user or assistant message adds to a session. Kept short so
 # 16 running sessions' turns fit in A's cache next to the contexts.
@@ -88,7 +101,10 @@ MAX_ERROR_SHARE = 0.01
 # ids vLLM builds from the X-Request-Id header.
 _OUR_ID = re.compile(r"pf\d{7}x")
 _TS = r"(\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})"
-_HIT = re.compile(_TS + r".*?Peer lookup_pin hit for (\S+?): (\d+) tokens")
+_HIT = re.compile(_TS + r".*?Peer lookup_pin hit for (\S+?): (\d+) tokens"
+                  r"(?: under pin (\S+))?")
+# A's line when it pins blocks for a lookup. B logs the same pin id on its hit.
+_PIN = re.compile(_TS + r".*?Peer lookup_pin pinned \d+ of \d+ blocks as (\S+)")
 _MISS = re.compile(_TS + r".*?Peer lookup for (\S+?) missed: (\S+)")
 
 
@@ -103,9 +119,11 @@ def text_tokenizer(model: str) -> Callable[[str], list[int]]:
 
 
 def build_contexts(
-    encode: Callable[[str], list[int]], sessions: list[list[dict]], lengths: list[int]
-) -> dict[int, list[int]]:
-    """One context per length, exactly that many tokens, from agent traces.
+    encode: Callable[[str], list[int]], sessions: list[list[dict]], lengths: list[int],
+    copies: int = 1,
+) -> dict[int, list[list[int]]]:
+    """`copies` contexts per length, each exactly that many tokens, from agent
+    traces.
 
     Each starts with its own header, so no two contexts share a block and a
     shorter one is never a prefix of a longer one.
@@ -113,15 +131,17 @@ def build_contexts(
     texts = [m["content"] for s in sessions for m in s if m["content"].strip()]
     if not texts:
         raise RuntimeError("the traces have no text to build contexts from")
-    contexts = {}
-    for n, length in enumerate(lengths):
-        # The first character differs per context, so their first blocks do.
-        ids = encode(f"{chr(ord('A') + n)}: context {length}. Repository notes follow.\n\n")
+    contexts: dict[int, list[list[int]]] = {length: [] for length in lengths}
+    for n, (copy, length) in enumerate(
+        (copy, length) for copy in range(copies) for length in lengths
+    ):
+        # The header differs per context, so their first blocks do.
+        ids = encode(f"{n}: context {length}. Repository notes follow.\n\n")
         at = n * 7
         while len(ids) < length:
             ids += encode(texts[at % len(texts)] + "\n\n")
             at += 1
-        contexts[length] = ids[:length]
+        contexts[length].append(ids[:length])
     return contexts
 
 
@@ -163,18 +183,21 @@ def session_prompts(
 
 
 def plan_sessions(args, encode, traces, contexts) -> list[dict]:
-    """The sweep's sessions, the same for every rate and arm."""
-    lengths = sorted(contexts)
+    """The sweep's sessions, the same for every rate and arm, spread over every
+    context in turn."""
+    order = [(length, copy) for copy in range(max(len(c) for c in contexts.values()))
+             for length in sorted(contexts) if copy < len(contexts[length])]  # fmt: skip
     planned = []
     for n, messages in enumerate(traces):
-        context = lengths[len(planned) % len(lengths)]
+        context, copy = order[len(planned) % len(order)]
         prompts = session_prompts(
-            contexts[context],
+            contexts[context][copy],
             session_turns(encode, messages, args.turns, args.turn_tokens),
             args.max_model_len, args.output_tokens,
         )  # fmt: skip
         if prompts:
-            planned.append({"session": n, "context": context, "prompts": prompts})
+            planned.append({"session": n, "context": context, "copy": copy,
+                            "prompts": prompts})  # fmt: skip
         if len(planned) == args.sessions:
             break
     return planned
@@ -238,16 +261,28 @@ def lookups(text: str, year: int) -> dict[str, dict]:
     found: dict[str, dict] = {}
     for line in text.splitlines():
         if match := _HIT.search(line):
-            stamp, request, tokens = match.groups()
+            stamp, request, tokens, pin = match.groups()
             ours = _OUR_ID.search(request)
             if ours:
-                found[ours.group()] = {"hit_tokens": int(tokens),
+                found[ours.group()] = {"hit_tokens": int(tokens), "pin": pin,
                                        "at": log_time(stamp, year)}  # fmt: skip
         elif match := _MISS.search(line):
             stamp, request, reason = match.groups()
             ours = _OUR_ID.search(request)
             if ours:
                 found[ours.group()] = {"miss": reason, "at": log_time(stamp, year)}
+    return found
+
+
+def pins(text: str, year: int) -> dict[str, float]:
+    """When A pinned blocks for each lookup, by pin id. B sends the lookup when
+    its scheduler first takes the request, and A pins within milliseconds, so
+    this is also about when B started on the request."""
+    found = {}
+    for line in text.splitlines():
+        if match := _PIN.search(line):
+            stamp, pin = match.groups()
+            found[pin] = log_time(stamp, year)
     return found
 
 
@@ -380,9 +415,9 @@ def first_prompt(contexts: dict[int, list[int]], sessions: list[dict],
     """The first turn of a session on this context, or the context plus a
     short tail if no session uses it."""
     for s in sessions:
-        if s["context"] == length:
+        if s["context"] == length and s["copy"] == 0:
             return s["prompts"][0]
-    return contexts[length] + [11] * 32
+    return contexts[length][0] + [11] * 32
 
 
 def smoke_burst(args, servers: Servers, context: list[int], ids: Ids) -> dict:
@@ -449,26 +484,27 @@ def smoke(args, servers: Servers, contexts, sessions, ids: Ids) -> dict:
         result["ok"] = False
         return result
     pool = result["pool_tokens"].get("A")
-    if pool and sum(contexts) > 0.8 * pool:
-        print(f"warning: the contexts take {sum(contexts)} tokens of A's {pool}; "
+    total = sum(len(c) for copies in contexts.values() for c in copies)
+    if pool and total > 0.8 * pool:
+        print(f"warning: the contexts take {total} tokens of A's {pool}; "
               "sessions may evict them", flush=True)  # fmt: skip
 
     smallest = min(contexts)
     params = address(result["records"]["A"]["0"])
-    case = peer_case(args, servers, contexts[smallest],
+    case = peer_case(args, servers, contexts[smallest][0],
                      first_prompt(contexts, sessions, smallest), params, ids)  # fmt: skip
     path = kv.read_path(args.logs["B"].read_text(errors="replace"))
     result["direct_peer"] = case
     result["read_path"] = path
     result["cuda_ipc"] = any("cuda_ipc" in row for row in path)
-    result["burst"] = smoke_burst(args, servers, contexts[smallest], ids)
+    result["burst"] = smoke_burst(args, servers, contexts[smallest][0], ids)
     result["ok"] = case["ok"] and result["cuda_ipc"] and result["burst"]["ok"]
     return result
 
 
 def verify(args, servers: Servers, contexts, sessions, params, ids: Ids) -> dict:
     return {
-        length: peer_case(args, servers, contexts[length],
+        length: peer_case(args, servers, contexts[length][0],
                           first_prompt(contexts, sessions, length), params, ids)
         for length in sorted(contexts)
     }  # fmt: skip
@@ -477,10 +513,11 @@ def verify(args, servers: Servers, contexts, sessions, params, ids: Ids) -> dict
 # Sweep ------------------------------------------------------------------------
 
 
-def warm(servers: Servers, contexts: dict[int, list[int]]) -> None:
+def warm(servers: Servers, contexts: dict[int, list[list[int]]]) -> None:
     """Put every context in A's cache, straight to A, not through a router."""
     for length in sorted(contexts):
-        kv.timed_stream(servers, servers.producer, {"prompt": contexts[length]})
+        for context in contexts[length]:
+            kv.timed_stream(servers, servers.producer, {"prompt": context})
 
 
 def run_arm(args, servers: Servers, arm: str, rate: float, sessions: list[dict],
@@ -495,6 +532,7 @@ def run_arm(args, servers: Servers, arm: str, rate: float, sessions: list[dict],
     before = shadow.scrape(router["metrics"])
     served = [h4.served(url) for url in urls]
     steps = [kv.metric_totals(url, STEP_METRICS) for url in urls]
+    a_log = h4.log_size(args.logs["A"])
     b_log = h4.log_size(args.logs["B"])
     records: list[dict] = []
     lock = threading.Lock()
@@ -522,22 +560,38 @@ def run_arm(args, servers: Servers, arm: str, rate: float, sessions: list[dict],
     info["step_s"] = {side: step_seconds(url, before_steps)
                       for side, url, before_steps in zip("AB", urls, steps)}  # fmt: skip
     info["load"] = {"A": shadow.engine_load(a), "B": shadow.engine_load(b)}
-    found = lookups(h4.log_since(args.logs["B"], b_log), time.localtime().tm_year)
+    year = time.localtime().tm_year
+    found = lookups(h4.log_since(args.logs["B"], b_log), year)
+    pinned = pins(h4.log_since(args.logs["A"], a_log), year)
     for record in records:
         result = found.get(record["id"])
         if result is None:
             continue
-        if "hit_tokens" in result:
-            record["hit_tokens"] = result["hit_tokens"]
-        else:
+        if "hit_tokens" not in result:
             record["miss"] = result["miss"]
+            continue
+        record["hit_tokens"] = result["hit_tokens"]
         if "sent_at" in record:
-            # From the client's send to B's lookup result: router hop, B's
-            # scheduling, and the wait for A's reply (A's fence and step).
-            record["lookup_s"] = result["at"] - record["sent_at"]
+            record.update(fetch_times(record, result, pinned.get(result["pin"])))
     return {"info": info, "records": sorted(records, key=lambda r: r["id"]),
             "requests": shadow.by_label(added, REQUESTS, "outcome"),
             "plans": shadow.by_label(added, shadow.PLANS, "outcome")}  # fmt: skip
+
+
+def fetch_times(record: dict, hit: dict, pinned_at: float | None) -> dict:
+    """Where a fetched request's time to first token went.
+
+    queue_s: send to A's pin. The router hop and B's queue: B sends the lookup
+      only when its scheduler first takes the request.
+    reply_s: A's pin to B's hit. A's reply and B noticing it on its next step.
+    pull_s: B's hit to the first token. The NIXL pull and computing the rest.
+    """
+    first_token = record["sent_at"] + record["ttft_s"]
+    times = {"pull_s": first_token - hit["at"]}
+    if pinned_at is not None:
+        times["queue_s"] = pinned_at - record["sent_at"]
+        times["reply_s"] = hit["at"] - pinned_at
+    return times
 
 
 def _quantiles(values: list[float]) -> dict:
@@ -548,18 +602,14 @@ def _quantiles(values: list[float]) -> dict:
             "p90": ordered[min(len(ordered) - 1, int(0.9 * len(ordered)))]}  # fmt: skip
 
 
-def summarize_arm(result: dict, baseline: dict[int, float]) -> dict:
-    """TTFT by context length, fetches, and fetches that lost to recompute."""
+def summarize_arm(result: dict) -> dict:
+    """TTFT by context length, fetches and lookup misses."""
     good = [r for r in result["records"] if "error" not in r]
     by_context = {
         length: _quantiles([r["ttft_s"] for r in good if r["context"] == length])
         for length in sorted({r["context"] for r in good})
     }
     fetched = [r for r in good if "hit_tokens" in r]
-    # A fetch lost when B would have answered sooner by recomputing: its TTFT
-    # is above B's idle recompute TTFT for the same context's first turn.
-    lost = [r for r in fetched
-            if r["context"] in baseline and r["ttft_s"] > baseline[r["context"]]]  # fmt: skip
     misses: dict[str, int] = {}
     for r in good:
         if "miss" in r:
@@ -568,14 +618,51 @@ def summarize_arm(result: dict, baseline: dict[int, float]) -> dict:
         "ttft_by_context": by_context,
         "fetches": len(fetched),
         "misses": misses,
-        "lost_fetches": len(lost),
-        "lookup_s": _quantiles([r["lookup_s"] for r in fetched if "lookup_s" in r]),
         "errors": len(result["records"]) - len(good),
         "requests": len(result["records"]),
     }
 
 
-def check(smoke_result: dict, verified: dict, sweep: dict, leak_free: bool) -> dict:
+def compare(by_arm: dict[str, dict], verified: dict) -> dict:
+    """Pull against recompute, at one rate.
+
+    Each fetched request in the active arm is paired with the same session's
+    same turn in the shadow arm, which arrived at the same time under the same
+    load and was recomputed. A fetch lost if its pair got its first token
+    sooner. The idle verify numbers show the pull and compute alone.
+    """
+    shadow_ttft = {(r["session"], r["turn"]): r["ttft_s"]
+                   for r in by_arm["shadow"]["records"] if "error" not in r}  # fmt: skip
+    fetched = [r for r in by_arm["active"]["records"]
+               if "hit_tokens" in r and "error" not in r]  # fmt: skip
+    pairs = [(r, shadow_ttft[(r["session"], r["turn"])]) for r in fetched
+             if (r["session"], r["turn"]) in shadow_ttft]  # fmt: skip
+    idle = {n: c["recompute"]["ttft_s"] for n, c in verified.items()}
+    pulled = [r for r in fetched if "pull_s" in r and r["context"] in idle]
+
+    def times(key: str) -> dict:
+        return _quantiles([r[key] for r in fetched if key in r])
+
+    return {
+        "fetches": len(fetched),
+        "paired": len(pairs),
+        "ttft_pulled": _quantiles([r["ttft_s"] for r, _ in pairs]),
+        "ttft_recomputed": _quantiles([s for _, s in pairs]),
+        "saved_s": _quantiles([s - r["ttft_s"] for r, s in pairs]),
+        "won": sum(r["ttft_s"] < s for r, s in pairs),
+        "lost": sum(r["ttft_s"] >= s for r, s in pairs),
+        "queue_s": times("queue_s"),
+        "reply_s": times("reply_s"),
+        "pull_s": times("pull_s"),
+        # Hit to first token against B recomputing the same context while idle.
+        "pull_beats_idle_recompute": sum(r["pull_s"] < idle[r["context"]]
+                                         for r in pulled),
+        "pulled_with_times": len(pulled),
+    }
+
+
+def check(smoke_result: dict, verified: dict, sweep: dict, leak_free: bool,
+          min_sends: int = MIN_SENDS) -> dict:  # fmt: skip
     arms = [(rate, arm, r) for rate, by_arm in sweep.items() for arm, r in by_arm.items()]
     sent = {f"{rate}": r["requests"].get("sent", 0)
             for rate, arm, r in arms if arm == "active"}  # fmt: skip
@@ -600,7 +687,8 @@ def check(smoke_result: dict, verified: dict, sweep: dict, leak_free: bool) -> d
         return {**checks, "no_leaks": {"ok": leak_free}}
     return {
         **checks,
-        "active_sent": {"ok": sum(sent.values()) > 0, "sent": sent},
+        "active_sent": {"ok": bool(sent) and all(n >= min_sends for n in sent.values()),
+                        "sent": sent, "min": min_sends},
         # Every request the router sent with a fetch did a lookup on B.
         "lookups_match_sends": {
             "ok": all(abs(looked[k] - sent[k]) <= LOOKUP_SLACK for k in sent),
@@ -621,14 +709,15 @@ def _s(value: float | None) -> str:
     return "-" if value is None else f"{value:.3f}"
 
 
-def print_summary(verified: dict, sweep: dict, checks: dict) -> None:
+def print_summary(verified: dict, sweep: dict, comparison: dict, checks: dict) -> None:
+    print("idle B, first turn of each context: recompute vs peer pull")
     print("context  recompute_s  peer_s  hit_tokens/expected")
     for length, case in verified.items():
         print(f"{length:>7}  {_s(case['recompute']['ttft_s']):>11}  "
               f"{_s(case['peer']['ttft_s']):>6}  "
               f"{case['hit_tokens']}/{case['expected_hit_tokens']}")  # fmt: skip
-    print("rate    arm     A run/wait  B run/wait  A/B served  sent  fetches  lost  "
-          "lookup p50  ttft p50 by context")  # fmt: skip
+    print("rate    arm     A run/wait  B run/wait  A/B served  sent  fetches  "
+          "ttft p50 by context")  # fmt: skip
     for rate, by_arm in sweep.items():
         for arm, r in by_arm.items():
             info, summary = r["info"], r["summary"]
@@ -641,8 +730,18 @@ def print_summary(verified: dict, sweep: dict, checks: dict) -> None:
                             for n, q in summary["ttft_by_context"].items())  # fmt: skip
             print(f"{rate:<7} {arm:<7} {loads[0]:>10}  {loads[1]:>10}  "
                   f"{info['served']['A']:.0f}/{info['served']['B']:.0f}  "
-                  f"{r['requests'].get('sent', 0):>4.0f}  {summary['fetches']:>7}  "
-                  f"{summary['lost_fetches']:>4}  {_s(summary['lookup_s']['p50']):>10}  {ttft}")
+                  f"{r['requests'].get('sent', 0):>4.0f}  {summary['fetches']:>7}  {ttft}")
+    if comparison:
+        print("under load: each fetched request vs the same request recomputed in "
+              "the shadow arm (p50 seconds)")  # fmt: skip
+        print("rate    paired  pulled_ttft  recomputed_ttft  saved  won/lost  "
+              "B_queue  A_reply  pull+compute  beats_idle_recompute")  # fmt: skip
+    for rate, c in comparison.items():
+        print(f"{rate:<7} {c['paired']:>6}  {_s(c['ttft_pulled']['p50']):>11}  "
+              f"{_s(c['ttft_recomputed']['p50']):>15}  {_s(c['saved_s']['p50']):>5}  "
+              f"{c['won']:>4}/{c['lost']:<4} {_s(c['queue_s']['p50']):>7}  "
+              f"{_s(c['reply_s']['p50']):>7}  {_s(c['pull_s']['p50']):>12}  "
+              f"{c['pull_beats_idle_recompute']}/{c['pulled_with_times']}")
     for name, result in checks.items():
         print(f"{'PASS' if result['ok'] else 'FAIL'}  {name}")
 
@@ -667,6 +766,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         default=[], help="another log to copy next to results.json")  # fmt: skip
     parser.add_argument("--contexts", default=DEFAULT_CONTEXTS,
                         help="shared context lengths in tokens")  # fmt: skip
+    parser.add_argument("--copies", type=int, default=DEFAULT_COPIES,
+                        help="contexts per length")  # fmt: skip
+    parser.add_argument("--min-sends", type=int, default=MIN_SENDS,
+                        help="fewest fetches the active arm must send per rate")  # fmt: skip
     parser.add_argument("--rates", default=DEFAULT_RATES,
                         help="session arrivals per second, one sweep step each")  # fmt: skip
     parser.add_argument("--sessions", type=int, default=240,
@@ -710,7 +813,7 @@ def main(argv: list[str] | None = None) -> int:
     encode = text_tokenizer(args.model)
     lengths = sorted({int(x) for x in args.contexts.split(",") if x.strip()})
     traces = h4.load_sessions(args.traces, max(args.sessions * 2, 16), args.seed)
-    contexts = build_contexts(encode, traces, lengths)
+    contexts = build_contexts(encode, traces, lengths, args.copies)
     sessions = plan_sessions(args, encode, traces, contexts)
     if not sessions:
         print("FAIL: no session fits the context window", flush=True)
@@ -737,32 +840,35 @@ def main(argv: list[str] | None = None) -> int:
 
     params = address(smoke_result["records"]["A"]["0"])
     verified = verify(args, servers, contexts, sessions, params, ids)
-    baseline = {n: c["recompute"]["ttft_s"] for n, c in verified.items()}
     if args.smoke_only or not all(c["ok"] for c in verified.values()):
         checks = check(smoke_result, verified, {}, h4.reset_cache(servers.producer))
         finish({"smoke": smoke_result, "verified": verified}, checks)
-        print_summary(verified, {}, checks)
+        print_summary(verified, {}, {}, checks)
         ok = all(c["ok"] for c in verified.values())
         print("PASS (smoke only)" if ok else "FAIL: verify", flush=True)
         return 0 if ok else 1
 
     sweep: dict[float, dict[str, dict]] = {}
+    comparison: dict[float, dict] = {}
     for rate in parse_floats(args.rates):
         sweep[rate] = {}
         for arm in ARMS:
             result = run_arm(args, servers, arm, rate, sessions, contexts, ids)
-            result["summary"] = summarize_arm(result, baseline)
+            result["summary"] = summarize_arm(result)
             sweep[rate][arm] = result
             print(json.dumps({"rate": rate, "arm": arm, "requests": result["requests"],
                               "fetches": result["summary"]["fetches"],
                               "load": result["info"]["load"]}), flush=True)  # fmt: skip
 
+        comparison[rate] = compare(sweep[rate], verified)
+
     leak_free = reset_all(servers)
-    checks = check(smoke_result, verified, sweep, leak_free)
-    finish({"contexts": lengths, "sessions": len(sessions),
+    checks = check(smoke_result, verified, sweep, leak_free, args.min_sends)
+    finish({"contexts": lengths, "copies": args.copies, "sessions": len(sessions),
             "smoke": smoke_result, "verified": verified,
-            "sweep": {str(k): v for k, v in sweep.items()}}, checks)  # fmt: skip
-    print_summary(verified, sweep, checks)
+            "sweep": {str(k): v for k, v in sweep.items()},
+            "comparison": {str(k): v for k, v in comparison.items()}}, checks)  # fmt: skip
+    print_summary(verified, sweep, comparison, checks)
     failed = [k for k, v in checks.items() if not v["ok"]]
     if failed:
         print(f"FAIL: {failed}", flush=True)

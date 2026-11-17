@@ -215,7 +215,8 @@ def argv(fakes, tmp_path, *extra: str) -> list[str]:
         "--router", f"shadow={routers['shadow'].url},{routers['shadow'].url}",
         "--contexts", "40,80", "--rates", "50", "--sessions", "4", "--turns", "2",
         "--max-model-len", "1000", "--block-size", str(BLOCK), "--smoke-burst", "4",
-        "--output-tokens", "4", "--traces", str(traces),
+        "--output-tokens", "4", "--traces", str(traces), "--copies", "1",
+        "--min-sends", "1",
         "--output", str(tmp_path / "out" / "results.json"), *extra,
     ]  # fmt: skip
 
@@ -238,8 +239,8 @@ def test_full_run_passes_every_check(fakes, tmp_path):
     prompts = {arm: sorted((r["session"], r["turn"], r["prompt_tokens"])
                            for r in sweep[arm]["records"]) for arm in active.ARMS}
     assert prompts["active"] == prompts["shadow"]
-    fetched = [r for r in sweep["active"]["records"] if "hit_tokens" in r]
-    assert all(r["lookup_s"] >= -1 for r in fetched)
+    comparison = result["comparison"]["50.0"]
+    assert comparison["fetches"] == comparison["paired"] > 0
 
 
 def test_engine_without_peer_record_stops_before_any_load(fakes, tmp_path):
@@ -277,10 +278,12 @@ def test_smoke_only_stops_after_verify(fakes, tmp_path):
 
 def test_contexts_have_exact_lengths_and_share_no_prefix():
     traces = [SESSION, SESSION]
-    contexts = active.build_contexts(encode, traces, [40, 80, 160])
+    contexts = active.build_contexts(encode, traces, [40, 80, 160], copies=2)
 
-    assert {n: len(c) for n, c in contexts.items()} == {40: 40, 80: 80, 160: 160}
-    assert contexts[40][:BLOCK] != contexts[80][:BLOCK]
+    assert {n: [len(c) for c in cs] for n, cs in contexts.items()} == {
+        40: [40, 40], 80: [80, 80], 160: [160, 160]}
+    firsts = {tuple(c[:BLOCK]) for cs in contexts.values() for c in cs}
+    assert len(firsts) == 6
 
 
 def test_session_prompts_extend_each_other_and_stop_at_the_window():
@@ -330,17 +333,27 @@ def test_record_problem_matches_the_routers_validation():
     assert active.record_problem({**good, "tp_size": 0}) == "zero size"
 
 
-def test_a_fetch_slower_than_recompute_counts_as_lost():
-    records = [
-        {"id": "pf0000001x", "context": 8000, "ttft_s": 0.2, "hit_tokens": 7936},
-        {"id": "pf0000002x", "context": 8000, "ttft_s": 0.9, "hit_tokens": 7936},
-        {"id": "pf0000003x", "context": 8000, "ttft_s": 0.5, "miss": "evicted"},
-        {"id": "pf0000004x", "context": 8000, "error": "boom"},
+def test_a_fetch_slower_than_the_same_request_recomputed_counts_as_lost():
+    shadow = [
+        {"id": "pf0000005x", "session": 0, "turn": 0, "context": 8000, "ttft_s": 0.5},
+        {"id": "pf0000006x", "session": 1, "turn": 0, "context": 8000, "ttft_s": 0.5},
     ]
+    active_records = [
+        {"id": "pf0000001x", "session": 0, "turn": 0, "context": 8000, "ttft_s": 0.2,
+         "hit_tokens": 7936, "queue_s": 0.05, "reply_s": 0.02, "pull_s": 0.1},
+        {"id": "pf0000002x", "session": 1, "turn": 0, "context": 8000, "ttft_s": 0.9,
+         "hit_tokens": 7936, "queue_s": 0.6, "reply_s": 0.2, "pull_s": 0.1},
+        {"id": "pf0000003x", "session": 2, "turn": 0, "context": 8000, "ttft_s": 0.5,
+         "miss": "evicted"},
+        {"id": "pf0000004x", "session": 3, "turn": 0, "context": 8000, "error": "boom"},
+    ]  # fmt: skip
+    verified = {8000: {"recompute": {"ttft_s": 0.6}}}
 
-    summary = active.summarize_arm({"records": records}, {8000: 0.6})
+    summary = active.summarize_arm({"records": active_records})
+    comparison = active.compare({"shadow": {"records": shadow},
+                                 "active": {"records": active_records}}, verified)
 
     assert summary["fetches"] == 2
-    assert summary["lost_fetches"] == 1
     assert summary["misses"] == {"evicted": 1}
-    assert summary["errors"] == 1
+    assert (comparison["paired"], comparison["won"], comparison["lost"]) == (2, 1, 1)
+    assert comparison["pull_beats_idle_recompute"] == 2
