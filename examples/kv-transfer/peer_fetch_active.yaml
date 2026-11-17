@@ -154,4 +154,3 @@ bench: >-
   --contexts 8000,16000,24000
   --rates 1,2,4,8
   --sessions 240
-  --smoke-only
