@@ -64,19 +64,23 @@ from modelsight.probes import kv_shadow as shadow
 from modelsight.probes import kv_transfer as kv
 from modelsight.probes.kv_transfer import Servers
 
-DEFAULT_CONTEXTS = "8000"
+# Context lengths, cycled across the contexts: 8k to 30k. Three of each of the
+# five lengths is about 294k tokens, under A's ~398k-token pool. A 30k context
+# leaves room for two turns in the 32k window; the rest keep all four.
+DEFAULT_CONTEXTS = "8000,14000,20000,26000,30000"
 # One distinct context per this many sessions. With only a few long contexts B
 # collects each on its first request and then holds every prefix the planner
 # could fetch, so at most a handful of fetches per arm were ever possible (the
 # first run sent 0 to 2 of ~960 per rate). Many contexts keep the asymmetry the
 # feature needs: A holds them all, B only the few it has already touched, so
 # every context's first request on B is a fetch opportunity.
-DEFAULT_CONTEXT_COUNT = 40
-DEFAULT_RATES = "1,1.25,1.5,1.75,2"
+DEFAULT_CONTEXT_COUNT = 15
+# At rate 1 A has no queue, so the router never plans a fetch.
+DEFAULT_RATES = "1.25,1.5,1.75,2"
 DEFAULT_VERIFY_CONTEXTS = 4
 # Fewest fetches the active arm must send at each rate for the comparison with
 # recompute to mean anything.
-MIN_SENDS = 10
+MIN_SENDS = 5
 ARMS = ("shadow", "active")
 # Most tokens one user or assistant message adds to a session. Kept short so
 # 16 running sessions' turns fit in A's cache next to the contexts.
@@ -334,20 +338,30 @@ class Ids:
 
 def timed(servers: Servers, url: str, prompt: list[int], request_id: str,
           max_tokens: int = OUTPUT_TOKENS) -> dict:  # fmt: skip
-    """TTFT of one streamed request, sent with our id."""
+    """TTFT of one streamed request, sent with our id, and how many of its
+    prompt tokens the engine found in its own cache (vLLM reports this with
+    --enable-prompt-tokens-details)."""
     sent_at = time.time()
     started = time.perf_counter()
-    first = None
+    first, cached = None, None
     body = {"prompt": prompt, "stream": True, "max_tokens": max_tokens,
-            "ignore_eos": True}  # fmt: skip
+            "ignore_eos": True, "stream_options": {"include_usage": True}}  # fmt: skip
     with kv.post(servers, url, body, {"X-Request-Id": request_id}) as response:
         for line in response:
-            if first is None and line.startswith(b"data:") and b"[DONE]" not in line:
+            if not line.startswith(b"data:") or b"[DONE]" in line:
+                continue
+            if first is None:
                 first = time.perf_counter() - started
+            if b'"cached_tokens"' in line:
+                usage = json.loads(line[5:]).get("usage") or {}
+                cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
     if first is None:
         raise RuntimeError("the stream ended without a token")
-    return {"sent_at": sent_at, "ttft_s": first,
-            "total_s": time.perf_counter() - started}  # fmt: skip
+    result = {"sent_at": sent_at, "ttft_s": first,
+              "total_s": time.perf_counter() - started}  # fmt: skip
+    if cached is not None:
+        result["cached_tokens"] = cached
+    return result
 
 
 def run_session(servers: Servers, url: str, session: dict, ids: Ids,
@@ -639,8 +653,9 @@ def compare(by_arm: dict[str, dict], verified: dict, length_of: dict[int, int]) 
     load and was recomputed. A fetch lost if its pair got its first token
     sooner. The idle verify numbers show the pull and compute alone.
     """
-    shadow_ttft = {(r["session"], r["turn"]): r["ttft_s"]
-                   for r in by_arm["shadow"]["records"] if "error" not in r}  # fmt: skip
+    twins = {(r["session"], r["turn"]): r
+             for r in by_arm["shadow"]["records"] if "error" not in r}  # fmt: skip
+    shadow_ttft = {key: r["ttft_s"] for key, r in twins.items()}
     fetched = [r for r in by_arm["active"]["records"]
                if "hit_tokens" in r and "error" not in r]  # fmt: skip
     pairs = [(r, shadow_ttft[(r["session"], r["turn"])]) for r in fetched
@@ -660,6 +675,13 @@ def compare(by_arm: dict[str, dict], verified: dict, length_of: dict[int, int]) 
         "saved_s": _quantiles([s - r["ttft_s"] for r, s in pairs]),
         "won": sum(r["ttft_s"] < s for r, s in pairs),
         "lost": sum(r["ttft_s"] >= s for r, s in pairs),
+        # Losses whose shadow twin found the prefix in its engine's own cache:
+        # the shadow run happened to route it to an engine that held the
+        # context, so the twin was a cache hit, not a recompute.
+        "lost_to_cache_hit": sum(
+            r["ttft_s"] >= s
+            and twins[(r["session"], r["turn"])].get("cached_tokens", 0) >= r["hit_tokens"]
+            for r, s in pairs),
         "queue_s": times("queue_s"),
         "reply_s": times("reply_s"),
         "pull_s": times("pull_s"),
@@ -745,11 +767,12 @@ def print_summary(verified: dict, sweep: dict, comparison: dict, checks: dict) -
         print("under load: each fetched request vs the same request recomputed in "
               "the shadow arm (p50 seconds)")  # fmt: skip
         print("rate    paired  pulled_ttft  recomputed_ttft  saved  won/lost  "
-              "B_queue  A_reply  pull+compute  beats_idle_recompute")  # fmt: skip
+              "lost_to_hit  B_queue  A_reply  pull+compute  beats_idle_recompute")  # fmt: skip
     for rate, c in comparison.items():
         print(f"{rate:<7} {c['paired']:>6}  {_s(c['ttft_pulled']['p50']):>11}  "
               f"{_s(c['ttft_recomputed']['p50']):>15}  {_s(c['saved_s']['p50']):>5}  "
-              f"{c['won']:>4}/{c['lost']:<4} {_s(c['queue_s']['p50']):>7}  "
+              f"{c['won']:>4}/{c['lost']:<4} {c['lost_to_cache_hit']:>11}  "
+              f"{_s(c['queue_s']['p50']):>7}  "
               f"{_s(c['reply_s']['p50']):>7}  {_s(c['pull_s']['p50']):>12}  "
               f"{c['pull_beats_idle_recompute']}/{c['pulled_with_times']}")  # fmt: skip
     for name, result in checks.items():

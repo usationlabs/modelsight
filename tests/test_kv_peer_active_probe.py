@@ -108,12 +108,19 @@ class FakeEngine:
                 self.write(f"(EngineCore pid=1) DEBUG {stamp()} [pull_scheduler.py:166] "
                            f"Peer lookup for {vllm_id} missed: not_cached")
         with self.lock:
+            cached = max((h4.expected_hit(list(p), list(prompt), BLOCK)
+                          for p in self.cache), default=0)
             self.cache.add(prompt)
             self.served += 1
         word = f"t{sum(prompt) % 7}"
         chunk = {"choices": [{"text": word, "logprobs": {
             "tokens": [word], "token_logprobs": [-0.1]}}]}
-        return f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode()
+        out = f"data: {json.dumps(chunk)}\n\n"
+        if (body.get("stream_options") or {}).get("include_usage"):
+            usage = {"choices": [], "usage": {
+                "prompt_tokens_details": {"cached_tokens": cached}}}
+            out += f"data: {json.dumps(usage)}\n\n"
+        return (out + "data: [DONE]\n\n").encode()
 
     def metrics(self) -> str:
         return (
@@ -241,6 +248,7 @@ def test_full_run_passes_every_check(fakes, tmp_path):
     assert prompts["active"] == prompts["shadow"]
     comparison = result["comparison"]["50.0"]
     assert comparison["fetches"] == comparison["paired"] > 0
+    assert all("cached_tokens" in r for r in sweep["shadow"]["records"])
 
 
 def test_engine_without_peer_record_stops_before_any_load(fakes, tmp_path):
@@ -337,7 +345,8 @@ def test_record_problem_matches_the_routers_validation():
 def test_a_fetch_slower_than_the_same_request_recomputed_counts_as_lost():
     shadow = [
         {"id": "pf0000005x", "session": 0, "turn": 0, "context": 0, "ttft_s": 0.5},
-        {"id": "pf0000006x", "session": 1, "turn": 0, "context": 0, "ttft_s": 0.5},
+        {"id": "pf0000006x", "session": 1, "turn": 0, "context": 0, "ttft_s": 0.5,
+         "cached_tokens": 8000},
     ]
     records = [
         {"id": "pf0000001x", "session": 0, "turn": 0, "context": 0, "ttft_s": 0.2,
@@ -359,4 +368,5 @@ def test_a_fetch_slower_than_the_same_request_recomputed_counts_as_lost():
     assert summary["misses"] == {"evicted": 1}
     assert summary["errors"] == 1
     assert (comparison["paired"], comparison["won"], comparison["lost"]) == (2, 1, 1)
+    assert comparison["lost_to_cache_hit"] == 1
     assert comparison["pull_beats_idle_recompute"] == 2
