@@ -67,8 +67,14 @@ TURN_TOKENS = 500
 # Tokens each turn generates. Decode is what keeps a session on A long enough
 # for sessions to pile up in A's queue.
 OUTPUT_TOKENS = 128
-SMOKE_BURST = 24
+SMOKE_BURST = 32
 SMOKE_OUTPUT_TOKENS = 256
+# New tokens each burst request adds after the shared context. kv_aware prices
+# a worker as (uncached prompt tokens + its in-flight prefill tokens) x (its
+# active requests + 1), so with a 64-token tail A, which holds the context,
+# stays cheapest until it has over 100 requests in flight. With 1024 new
+# tokens, B wins once A has about 8.
+SMOKE_TAIL_TOKENS = 1024
 # Router counter: one per request the active planner granted a fetch, by what
 # the router then did with it (sent, no_peer_endpoint, inflight_cap, ...).
 REQUESTS = "vllm_router_kv_transfer_requests_total"
@@ -378,7 +384,8 @@ def smoke_burst(args, servers: Servers, context: list[int], ids: Ids) -> dict:
 
     def one(n: int) -> None:
         try:
-            timed(servers, router["url"], context + [11 + n] * 64, ids.take(),
+            tail = kv.fresh_prompt(random.Random(f"smoke-{n}"), SMOKE_TAIL_TOKENS)
+            timed(servers, router["url"], context + tail, ids.take(),
                   SMOKE_OUTPUT_TOKENS)  # fmt: skip
         except (OSError, RuntimeError, ValueError) as exc:
             errors.append(repr(exc))
