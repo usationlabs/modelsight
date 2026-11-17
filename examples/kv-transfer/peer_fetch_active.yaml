@@ -81,7 +81,9 @@ server: |
   export VLLM_LOGGING_CONFIG_PATH=/tmp/vllm-logging.json
 
   # --hf-overrides / --max-model-len 131072: YaRN, factor 4, for 128k-token
-  #   contexts (Qwen3-8B is 32k natively). Same on both engines, so their KV
+  #   contexts (Qwen3-8B is 32k natively). This vLLM takes `rope_parameters`
+  #   (with Qwen3's rope_theta), not `rope_scaling`; see
+  #   docs/features/context_extension.md. Same on both engines, so their KV
   #   layouts match.
   # --block-size 64: the same on both engines; the router reads it from them.
   # --max-num-seqs 16: H5's running limit, so sessions beyond it queue.
@@ -94,7 +96,7 @@ server: |
     CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL vllm serve Qwen/Qwen3-8B \
       --port $3 \
       --max-model-len 131072 \
-      --hf-overrides '{"rope_scaling": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}}' \
+      --hf-overrides '{"rope_parameters": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768, "rope_theta": 1000000}}' \
       --gpu-memory-utilization 0.9 \
       --block-size 64 \
       --max-num-seqs 16 \
