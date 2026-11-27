@@ -163,6 +163,8 @@ class FakeApp:
     """Records how the app was run; function() hands back something callable."""
 
     runs: list[dict] = []
+    functions: list[dict] = []
+    clustered: list[dict] = []
     remote_calls = 0
     spawn_calls = 0
     app_id = "ap-fake"
@@ -171,11 +173,17 @@ class FakeApp:
         pass
 
     def function(self, **kwargs):
+        FakeApp.functions.append(kwargs)
         return FakeFunction
 
     def run(self, **kwargs):
         FakeApp.runs.append(kwargs)
         return _NullContext()
+
+
+def fake_clustered(*, size: int, rdma: bool = False):
+    FakeApp.clustered.append({"size": size, "rdma": rdma})
+    return lambda fn: fn
 
 
 class _NullContext:
@@ -191,6 +199,7 @@ def fake_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Fake Modal for build()/run()/attach(); saved run state goes to a temp dir."""
     monkeypatch.chdir(tmp_path)
     FakeApp.runs = []
+    FakeApp.functions, FakeApp.clustered = [], []
     FakeApp.remote_calls = FakeApp.spawn_calls = 0
     FakeCall.outcome = None
     FakeCall.gets = 0
@@ -204,6 +213,7 @@ def fake_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             Volume=FakeVolume,
             App=FakeApp,
             FunctionCall=FakeCall,
+            clustered=fake_clustered,
             enable_output=lambda: _NullContext(),
             exception=real_modal.exception,
             config=SimpleNamespace(_profile="work"),
@@ -245,6 +255,31 @@ def test_run_is_attached_by_default_and_says_what_a_disconnect_does(
     out = capsys.readouterr().out
     assert "not detached" in out and "--detach" in out
     assert "even if this laptop disconnects" not in out
+    # one container, never clustered
+    assert fake_app.clustered == [] and "nodes=" not in out
+    assert fake_app.functions[-1]["gpu"] == "B200:8"
+
+
+def test_a_multi_node_run_is_clustered_with_rdma_and_one_gpu_spec_per_container(
+    fake_app, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exp = _experiment(output=str(tmp_path), gpu="H100", nodes=2, rdma=True, bench_rank=1)
+    target.run(exp, "yaml", "name", prepare(exp), detach=True)
+    assert fake_app.clustered == [{"size": 2, "rdma": True}]
+    assert fake_app.functions[-1]["gpu"] == "H100"
+    assert fake_app.spawn_calls == 1  # one call for the whole cluster
+    assert "nodes=2 rdma=True bench_rank=1" in capsys.readouterr().out
+
+
+def test_cluster_rank_and_ips_prefer_ipv4(monkeypatch: pytest.MonkeyPatch) -> None:
+    import modal.experimental
+
+    info = SimpleNamespace(rank=1, container_ips=["fd00::1", "fd00::2"],
+                           container_ipv4_ips=["10.0.0.1", "10.0.0.2"])  # fmt: skip
+    monkeypatch.setattr(modal.experimental, "get_cluster_info", lambda: info)
+    assert target.cluster_rank_and_ips() == (1, ["10.0.0.1", "10.0.0.2"])
+    info.container_ipv4_ips = []
+    assert target.cluster_rank_and_ips() == (1, ["fd00::1", "fd00::2"])
 
 
 def test_a_detached_run_is_spawned_and_remembered(

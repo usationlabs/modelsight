@@ -37,12 +37,19 @@ _KNOWN_FIELDS = {
     "cache",
     "secrets",
     "report",
+    "nodes",
+    "rdma",
+    "bench_rank",
+    "ready_urls",
 }
 _CACHE_FIELDS = {"prefetch", "volume", "mount"}
 _SOURCE_FIELDS = {"repo", "ref"}
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SOURCE_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _DURATION = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
+# `{node0}` ... `{nodeN}` in ready_url(s) stand for that rank's IP.
+NODE_PLACEHOLDER = re.compile(r"\{node(\d+)\}")
+MAX_NODES = 8
 
 
 class ConfigError(Exception):
@@ -93,6 +100,20 @@ class Experiment:
     secrets: tuple[str, ...] = ()
     # Shell commands whose output is appended to env.txt.
     report: tuple[str, ...] = ()
+    # Over 1, the run is a cluster: every rank runs `server`, one also `bench`.
+    nodes: int = 1
+    rdma: bool = False
+    bench_rank: int | None = None
+    # More URLs the bench waits on, next to ready_url (placeholders allowed).
+    ready_urls: tuple[str, ...] = ()
+
+    @property
+    def clustered(self) -> bool:
+        return self.nodes > 1
+
+    @property
+    def bench_rank_resolved(self) -> int:
+        return self.nodes - 1 if self.bench_rank is None else self.bench_rank
 
     @property
     def ready_timeout_seconds(self) -> float:
@@ -142,7 +163,20 @@ class Experiment:
             }
         if self.add_python:
             data["add_python"] = self.add_python
+        if self.nodes != 1:
+            data["nodes"] = self.nodes
+        if self.rdma:
+            data["rdma"] = True
+        if self.bench_rank is not None:
+            data["bench_rank"] = self.bench_rank
+        if self.ready_urls:
+            data["ready_urls"] = list(self.ready_urls)
         return data
+
+
+def resolve_nodes(url: str, ips: list[str] | tuple[str, ...]) -> str:
+    """Replace `{nodeN}` in a URL with rank N's IP."""
+    return NODE_PLACEHOLDER.sub(lambda m: ips[int(m.group(1))], url)
 
 
 def parse_duration(value: str) -> float:
@@ -236,9 +270,17 @@ def experiment_from_mapping(data: dict) -> Experiment:
     if sources and not dockerfile:
         raise ConfigError("sources are passed to a Dockerfile, so dockerfile is required")
 
+    nodes, rdma, bench_rank = _parse_cluster(data)
     ready_url = _optional_string(data, "ready_url") or DEFAULT_READY_URL
-    if not ready_url.startswith(("http://", "https://")):
-        raise ConfigError("ready_url must start with http:// or https://")
+    ready_urls = _string_list(data.get("ready_urls"), "ready_urls")
+    for field, url in [("ready_url", ready_url)] + [("ready_urls", u) for u in ready_urls]:
+        if not url.startswith(("http://", "https://")):
+            raise ConfigError(f"{field} must start with http:// or https://")
+        for match in NODE_PLACEHOLDER.finditer(url):
+            if int(match.group(1)) >= nodes:
+                raise ConfigError(
+                    f"{field} uses {match.group(0)}, but the run has {nodes} node(s)"
+                )
     ready_timeout = _optional_string(data, "ready_timeout") or DEFAULT_READY_TIMEOUT
     timeout = _optional_string(data, "timeout") or DEFAULT_TIMEOUT
     parse_duration(ready_timeout)
@@ -261,7 +303,33 @@ def experiment_from_mapping(data: dict) -> Experiment:
         cache=cache,
         secrets=secrets,
         report=_string_list(data.get("report"), "report"),
+        nodes=nodes,
+        rdma=rdma,
+        bench_rank=bench_rank,
+        ready_urls=ready_urls,
     )
+
+
+def _parse_cluster(data: dict) -> tuple[int, bool, int | None]:
+    nodes = data.get("nodes", 1)
+    if isinstance(nodes, bool) or not isinstance(nodes, int):
+        raise ConfigError("nodes must be an integer")
+    if not 1 <= nodes <= MAX_NODES:
+        raise ConfigError(f"nodes must be between 1 and {MAX_NODES}, got {nodes}")
+    rdma = data.get("rdma", False)
+    if rdma is None:
+        rdma = False
+    if not isinstance(rdma, bool):
+        raise ConfigError("rdma must be true or false")
+    if rdma and nodes < 2:
+        raise ConfigError("rdma needs nodes > 1")
+    bench_rank = data.get("bench_rank")
+    if bench_rank is not None:
+        if isinstance(bench_rank, bool) or not isinstance(bench_rank, int):
+            raise ConfigError("bench_rank must be an integer")
+        if not 0 <= bench_rank < nodes:
+            raise ConfigError(f"bench_rank must be in 0..{nodes - 1}, got {bench_rank}")
+    return nodes, rdma, bench_rank
 
 
 def _require_string(data: dict, field: str) -> str:

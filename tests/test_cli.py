@@ -27,7 +27,16 @@ def test_dry_run_prints_the_plan_and_launches_nothing(
     assert "lmsysorg/sglang:test" in result.stdout
     assert "sglang.launch_server" in result.stdout
     assert "aiperf profile" in result.stdout
+    assert "nodes:" not in result.stdout  # single node: nothing about clusters
     assert not (tmp_path / "results").exists()
+
+    config.write_text(
+        config.read_text() + "nodes: 2\nrdma: true\nready_urls: ['http://{node0}:8100/health']\n"
+    )
+    result = runner.invoke(app, ["run", "-f", str(config), "--dry-run"])
+    assert result.exit_code == 0, result.stdout
+    assert "nodes: 2 (rdma: yes, bench rank: 1)" in result.stdout
+    assert "ready_urls: http://{node0}:8100/health" in result.stdout
 
 
 def test_invalid_config_exits_nonzero(tmp_path: Path) -> None:
