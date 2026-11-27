@@ -1,4 +1,9 @@
-"""Start a server, wait until it responds, run the bench command, always stop the server."""
+"""Start a server, wait until it responds, run the bench command, always stop the server.
+
+A cluster run (`nodes > 1`) does the same on every rank: each starts `server`,
+the bench rank waits for every ready URL, runs `bench` and says it is done, and
+the other ranks keep serving until then (see `execute_cluster_run`).
+"""
 
 from __future__ import annotations
 
@@ -12,11 +17,13 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import IO
 
 from modelsight import __version__
-from modelsight.config import Experiment
+from modelsight.config import Experiment, resolve_nodes
+from modelsight.control import DEFAULT_PORT, ControlServer, peer_state
 
 # How long a server gets to exit after SIGTERM before it is killed.
 _STOP_GRACE_SECONDS = 10
@@ -28,6 +35,11 @@ MODAL_TIMEOUT_BUFFER_SECONDS = 120
 # A volume commit that takes longer than this is abandoned, so a slow one cannot
 # hold a GPU container idle after the run is over.
 COMMIT_TIMEOUT_SECONDS = 180
+# A non-bench rank gives up once the bench rank has not answered for this long.
+PEER_LOST_SECONDS = 120
+# After it finishes, a rank waits at most this long for the others to see it.
+LINGER_SECONDS = 200  # covers the other ranks' commit (COMMIT_TIMEOUT_SECONDS)
+COMMIT_WAIT_SECONDS = 240  # the bench rank's volume commit, from rank 0's side
 
 
 class RunError(Exception):
@@ -47,6 +59,31 @@ def allocate_run_dir(output: str, run_name: str) -> Path:
     return run_dir
 
 
+def rank_env(
+    rank: int, ips: Sequence[str], run_dir: Path, control_port: int = DEFAULT_PORT
+) -> dict[str, str]:
+    """What `server` and `bench` learn about the cluster, on every rank.
+
+    A single-node run is rank 0 of 1 at 127.0.0.1.
+    """
+    env = {
+        "MS_RANK": str(rank),
+        "MS_NODES": str(len(ips)),
+        "MS_NODE_IPS": ",".join(ips),
+        "MS_NODE_IP": ips[rank],
+        "MS_RUN_DIR": str(run_dir),
+        "MS_RANK_DIR": str(run_dir / f"rank-{rank}"),
+        "MS_CONTROL_PORT": str(control_port),
+    }
+    for n, ip in enumerate(ips):
+        env[f"MS_NODE{n}_IP"] = ip
+    return env
+
+
+def ready_urls(exp: Experiment, ips: Sequence[str]) -> list[str]:
+    return [resolve_nodes(url, ips) for url in (exp.ready_url, *exp.ready_urls)]
+
+
 def execute_run(
     exp: Experiment, run_dir: Path, config_text: str, extra_env: str = ""
 ) -> None:
@@ -62,24 +99,28 @@ def execute_run(
         environment_report(exp.image) + extra_env + report_section(exp.report)
     )
 
+    ips = ["127.0.0.1"]
+    env = rank_env(0, ips, run_dir)
     deadline = time.monotonic() + exp.timeout_seconds
     server, server_log = start_process(
-        exp.server, run_dir / "server.log", cwd=Path.cwd(), prefix="[server] "
+        exp.server, run_dir / "server.log", cwd=Path.cwd(), prefix="[server] ", env=env
     )
     bench = None
     bench_log = None
     try:
-        print(f"waiting for {exp.ready_url}", flush=True)
+        urls = ready_urls(exp, ips)
+        print(f"waiting for {', '.join(urls)}", flush=True)
         wait_until_ready(
             exp,
             server,
             run_dir / "server.log",
             deadline=min(time.monotonic() + exp.ready_timeout_seconds, deadline),
             overall_deadline=deadline,
+            urls=urls,
         )
         print("server is ready, starting bench", flush=True)
         bench, bench_log = start_process(
-            exp.bench, run_dir / "bench.log", cwd=run_dir, prefix="[bench] "
+            exp.bench, run_dir / "bench.log", cwd=run_dir, prefix="[bench] ", env=env
         )
         wait_for_exit(bench, deadline, exp.timeout)
         if bench.returncode != 0:
@@ -93,6 +134,184 @@ def execute_run(
         print("stopping server", flush=True)
         stop_process(server)
         server_log.close()
+
+
+def execute_cluster_run(
+    exp: Experiment,
+    run_dir: Path,
+    config_text: str,
+    rank: int,
+    ips: Sequence[str],
+    extra_env: str = "",
+    control_ports: Sequence[int] | None = None,
+    peer_lost_seconds: float = PEER_LOST_SECONDS,
+    linger_seconds: float = LINGER_SECONDS,
+    finalize: Callable[[], None] | None = None,
+    commit_wait_seconds: float = COMMIT_WAIT_SECONDS,
+) -> None:
+    """One rank of a cluster run. Every rank of the cluster calls this.
+
+    Every rank starts `server`, logging to run_dir/rank-<r>/server.log, and serves
+    its state and logs on its control port. The bench rank waits for the ready
+    URLs, runs `bench` in run_dir, marks itself done and stops its server. The
+    other ranks serve until the bench rank is done, fails, or has not answered
+    for `peer_lost_seconds`. A server that exits early fails its rank, and the
+    other ranks stop when they see that. `control_ports` (one per rank) exist so
+    a test can run two ranks on one host.
+
+    After a successful run every rank calls `finalize` (the volume commit) and then
+    reports `committed`. A rank that is not the bench rank returns only once the
+    bench rank has reported `committed` too (or `commit_wait_seconds` pass), so the
+    client does not download results before the bench rank's files are committed.
+    """
+    nodes = len(ips)
+    if nodes != exp.nodes:
+        raise RunError(f"the cluster has {nodes} containers, but the run asks for {exp.nodes}")
+    ports = list(control_ports) if control_ports else [DEFAULT_PORT] * nodes
+    bench_rank = exp.bench_rank_resolved
+    is_bench = rank == bench_rank
+    rank_dir = run_dir / f"rank-{rank}"
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    if is_bench:
+        (run_dir / "exp.yaml").write_text(config_text)
+        (run_dir / "commands.txt").write_text(f"server: {exp.server}\nbench: {exp.bench}\n")
+    (rank_dir / "env.txt").write_text(
+        f"rank: {rank} of {nodes}, bench rank {bench_rank}, ips {','.join(ips)}\n"
+        + environment_report(exp.image) + extra_env + report_section(exp.report)
+    )
+
+    control = ControlServer(rank, rank_dir, port=ports[rank]).start()
+    env = rank_env(rank, ips, run_dir, ports[rank])
+    others = [r for r in range(nodes) if r != rank]
+    deadline = time.monotonic() + exp.timeout_seconds
+    print(f"rank {rank} of {nodes} at {ips[rank]}"
+          f"{' (bench)' if is_bench else ''}", flush=True)  # fmt: skip
+    server, server_log = start_process(
+        exp.server, rank_dir / "server.log", cwd=Path.cwd(), prefix="[server] ", env=env
+    )
+    control.set("serving")
+    try:
+        if is_bench:
+            _bench_rank(exp, run_dir, rank_dir, server, env, deadline, control,
+                        [(ips[r], ports[r], r) for r in others], ips)  # fmt: skip
+        else:
+            _serving_rank(exp, server, rank_dir, deadline,
+                          (ips[bench_rank], ports[bench_rank]), peer_lost_seconds)  # fmt: skip
+        control.set("done")
+    except BaseException:
+        control.set("failed")
+        raise
+    finally:
+        print("stopping server", flush=True)
+        stop_process(server)
+        server_log.close()
+        if control.state == "done":
+            if finalize is not None:
+                finalize()
+            control.set("committed")
+            if not is_bench:
+                _wait_peer_committed(ips[bench_rank], ports[bench_rank], commit_wait_seconds)
+        if is_bench:
+            # Stay reachable until the other ranks have committed or failed.
+            _linger(control, [(ips[r], ports[r]) for r in others], linger_seconds)
+        elif control.state == "failed":
+            _linger_until(lambda: peer_state(ips[bench_rank], ports[bench_rank], 1)
+                          in (None, "committed", "failed"), linger_seconds)  # fmt: skip
+        control.stop()
+
+
+def _bench_rank(exp, run_dir, rank_dir, server, env, deadline, control, peers, ips) -> None:
+    def peer_failed() -> str | None:
+        for ip, port, r in peers:
+            if peer_state(ip, port, 2) == "failed":
+                return f"rank {r} failed"
+        return None
+
+    urls = ready_urls(exp, ips)
+    print(f"waiting for {', '.join(urls)}", flush=True)
+    wait_until_ready(
+        exp,
+        server,
+        rank_dir / "server.log",
+        deadline=min(time.monotonic() + exp.ready_timeout_seconds, deadline),
+        overall_deadline=deadline,
+        urls=urls,
+        abort=peer_failed,
+    )
+    print("servers are ready, starting bench", flush=True)
+    control.set("running_bench")
+    bench, bench_log = start_process(
+        exp.bench, run_dir / "bench.log", cwd=run_dir, prefix="[bench] ", env=env
+    )
+    try:
+        while bench.poll() is None:
+            if time.monotonic() >= deadline:
+                raise RunError(f"run exceeded timeout of {exp.timeout}")
+            if server.poll() is not None:
+                raise RunError(f"server exited during the bench (status {server.returncode})\n"
+                               + _tail(rank_dir / "server.log"))  # fmt: skip
+            reason = peer_failed()
+            if reason:
+                raise RunError(f"{reason} during the bench")
+            time.sleep(_POLL_SECONDS)
+        if bench.returncode != 0:
+            raise RunError(f"bench command exited with status {bench.returncode}")
+        print("bench finished", flush=True)
+    finally:
+        if bench.poll() is None:
+            stop_process(bench)
+        bench_log.close()
+
+
+def _serving_rank(exp, server, rank_dir, deadline, bench_at, peer_lost_seconds) -> None:
+    ip, port = bench_at
+    last_seen = time.monotonic()
+    while True:
+        if server.poll() is not None:
+            raise RunError(f"server exited early (status {server.returncode})\n"
+                           + _tail(rank_dir / "server.log"))  # fmt: skip
+        now = time.monotonic()
+        if now >= deadline:
+            raise RunError(f"run exceeded timeout of {exp.timeout}")
+        state = peer_state(ip, port, 2)
+        if state is not None:
+            last_seen = now
+        if state in ("done", "committed"):
+            print("the bench rank is done", flush=True)
+            return
+        if state == "failed":
+            raise RunError("the bench rank failed")
+        if state is None and now - last_seen > peer_lost_seconds:
+            raise RunError(f"lost the bench rank at {ip}:{port} for {peer_lost_seconds:g}s")
+        time.sleep(_POLL_SECONDS)
+
+
+def _linger(control: ControlServer, peers: list[tuple[str, int]], seconds: float) -> None:
+    def all_seen() -> bool:
+        return all(peer_state(ip, port, 1) in (None, "committed", "failed") for ip, port in peers)
+
+    _linger_until(all_seen, seconds)
+
+
+def _wait_peer_committed(ip: str, port: int, seconds: float) -> bool:
+    """Wait (bounded) until the bench rank reports committed or failed."""
+    seen: list[str | None] = []
+
+    def ready() -> bool:
+        seen[:] = [peer_state(ip, port, 1)]
+        return seen[0] in ("committed", "failed")
+
+    _linger_until(ready, seconds)
+    if not ready():
+        print(f"warning: the bench rank had not committed after {seconds:g}s; going on", flush=True)
+        return False
+    return True
+
+
+def _linger_until(done: Callable[[], bool], seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and not done():
+        time.sleep(0.2)
 
 
 def commit_with_timeout(label: str, volume, timeout: float = COMMIT_TIMEOUT_SECONDS) -> bool:
@@ -244,8 +463,13 @@ class _LogTee:
 
 
 def start_process(
-    command: str, log_path: Path, cwd: Path, prefix: str = ""
+    command: str,
+    log_path: Path,
+    cwd: Path,
+    prefix: str = "",
+    env: dict[str, str] | None = None,
 ) -> tuple[subprocess.Popen[str], _LogTee]:
+    """Start `command` in its own process group; `env` adds to os.environ."""
     log_file = log_path.open("w", buffering=1)
     # A new session makes the command its own process group, so teardown can
     # signal the server and every child it spawned.
@@ -260,6 +484,7 @@ def start_process(
             start_new_session=True,
             text=True,
             errors="replace",
+            env={**os.environ, **env} if env else None,
         )
     except Exception:
         log_file.close()
@@ -285,7 +510,11 @@ def wait_until_ready(
     server_log: Path,
     deadline: float,
     overall_deadline: float,
+    urls: Sequence[str] | None = None,
+    abort: Callable[[], str | None] | None = None,
 ) -> None:
+    """Wait until every URL answers 200. `abort` returns a reason to give up."""
+    pending = list(urls) if urls else [exp.ready_url]
     last_error = "no response yet"
     while True:
         if server.poll() is not None:
@@ -293,16 +522,23 @@ def wait_until_ready(
                 f"server exited before it was ready (status {server.returncode})\n"
                 + _tail(server_log)
             )
+        reason = abort() if abort else None
+        if reason:
+            raise RunError(f"{reason} before the servers were ready")
         now = time.monotonic()
         if now >= overall_deadline:
             raise RunError(f"run exceeded timeout of {exp.timeout}\n" + _tail(server_log))
         if now >= deadline:
             raise RunError(
-                f"server did not become ready at {exp.ready_url} within {exp.ready_timeout}"
+                f"server did not become ready at {pending[0]} within {exp.ready_timeout}"
                 f" ({last_error})\n" + _tail(server_log)
             )
-        status, last_error = _probe(exp.ready_url)
-        if status == 200:
+        while pending:
+            status, last_error = _probe(pending[0])
+            if status != 200:
+                break
+            pending.pop(0)
+        if not pending:
             return
         time.sleep(min(_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 

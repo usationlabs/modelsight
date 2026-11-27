@@ -10,6 +10,7 @@ from modelsight.config import (
     experiment_from_mapping,
     load_experiment,
     parse_duration,
+    resolve_nodes,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,6 +99,8 @@ def test_new_sections_are_optional(tmp_path: Path) -> None:
     assert experiment.cache is None
     assert experiment.secrets == ()
     assert experiment.report == ()
+    assert (experiment.nodes, experiment.rdma, experiment.bench_rank) == (1, False, None)
+    assert experiment.ready_urls == () and not experiment.clustered
 
 
 def test_dockerfile_is_resolved_relative_to_the_experiment_file(tmp_path: Path) -> None:
@@ -171,6 +174,13 @@ def test_secrets_and_report(tmp_path: Path) -> None:
         ("secrets: HF_TOKEN\n", "list of strings"),
         ("secrets: ['not a name']\n", "environment variable"),
         ("report: [3]\n", "non-empty strings"),
+        ("nodes: 9\n", "between 1 and 8"),
+        ("nodes: two\n", "nodes must be an integer"),
+        ("rdma: true\n", "rdma needs nodes > 1"),
+        ("nodes: 2\nrdma: yes please\n", "rdma must be true or false"),
+        ("nodes: 2\nbench_rank: 2\n", "bench_rank must be in 0..1"),
+        ("ready_url: http://{node1}:1/\n", "{node1}, but the run has 1 node"),
+        ("nodes: 2\nready_urls: [localhost:1]\n", "ready_urls must start"),
     ],
 )
 def test_invalid_sections_are_rejected(tmp_path: Path, extra: str, message: str) -> None:
@@ -217,11 +227,57 @@ cache:
 build_args: {A: b}
 sources:
   DYNAMO: {repo: https://github.com/a/b, ref: dev}
+nodes: 2
+rdma: true
+bench_rank: 1
+ready_url: http://localhost:8200/health
+ready_urls: ["http://{node0}:8100/health"]
 """,
     )
     assert experiment_from_mapping(experiment.to_mapping()) == experiment
+    assert experiment.clustered and experiment.bench_rank_resolved == 1
+    assert experiment.ready_urls == ("http://{node0}:8100/health",)
 
 
 def test_plain_experiment_round_trips(tmp_path: Path) -> None:
     experiment, _ = _load(tmp_path, "target: local\nserver: s\nbench: b\n")
     assert experiment_from_mapping(experiment.to_mapping()) == experiment
+    # a single-node mapping carries none of the cluster fields
+    assert not {"nodes", "rdma", "bench_rank", "ready_urls"} & set(experiment.to_mapping())
+
+
+def test_bench_rank_defaults_to_the_last_node_and_placeholders_resolve(tmp_path: Path) -> None:
+    experiment, _ = _load(tmp_path, MODAL_BASE + "nodes: 3\nready_url: http://{node2}:1/\n")
+    assert experiment.bench_rank is None and experiment.bench_rank_resolved == 2
+    assert resolve_nodes(experiment.ready_url, ["a", "b", "10.0.0.3"]) == "http://10.0.0.3:1/"
+
+
+H6_YAMLS = sorted((ROOT / "examples" / "kv-transfer").glob("h6*.yaml"))
+
+
+@pytest.mark.parametrize("path", H6_YAMLS, ids=lambda p: p.name)
+def test_h6_yamls_load_as_single_node_two_gpu_runs(path: Path) -> None:
+    experiment, _ = load_experiment(path)
+
+    assert (experiment.nodes, experiment.rdma) == (1, False)
+    assert Path(experiment.dockerfile).name == "Dockerfile.h6"
+    assert experiment.gpu == "A100-80GB:2"
+    assert experiment.ready_urls == ("http://localhost:8100/health",)
+    assert "kv_peer_stage_load" in experiment.bench and "--no-rdma-gate" in experiment.bench
+    assert "/opt/h6_server.sh" in experiment.server
+
+
+def test_dockerfile_h6_provides_every_opt_path_the_h6_files_use() -> None:
+    import re
+
+    kv = ROOT / "examples" / "kv-transfer"
+    dockerfile = (kv / "Dockerfile.h6").read_text()
+    used = set()
+    for path in [*H6_YAMLS, kv / "h6_server.sh"]:
+        used |= set(re.findall(r"/opt/[A-Za-z0-9_/-]+(?:\.[A-Za-z0-9_]+)*", path.read_text()))
+    assert "/opt/h6_server.sh" in used
+    missing = sorted(p for p in used if p not in dockerfile)
+    assert not missing, f"Dockerfile.h6 never mentions {missing}"
+    # a path the image gets from a COPY must have its source in the build context
+    for source, dest in re.findall(r"^COPY (\S+) (/opt/\S+)", dockerfile, re.M):
+        assert (kv / source).exists() or source.endswith(".tar.gz"), source

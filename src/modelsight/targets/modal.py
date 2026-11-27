@@ -1,7 +1,9 @@
 """Run the same commands inside one Modal container, then copy the results back.
 
 The server and the bench run in the same container, so the bench command talks
-to localhost. AIPerf is installed with uv into its own environment, leaving the
+to localhost. With `nodes > 1` the function is clustered: Modal starts that many
+containers, each runs `server`, and the bench rank also runs `bench`; every
+rank writes under the same run directory on the results volume. AIPerf is installed with uv into its own environment, leaving the
 image's engine environment alone. The image comes from `modelsight.build`:
 a Dockerfile (or registry image) is the base, and ms adds its own layers on top.
 """
@@ -29,6 +31,33 @@ APP_NAME = "modelsight"
 # Downloading a large checkpoint takes a while; this only caps a hung download.
 PREFETCH_TIMEOUT_SECONDS = 4 * 3600
 RENDERED_DOCKERFILES = Path.home() / ".cache" / "modelsight" / "dockerfiles"
+
+
+def cluster_decorator(size: int, rdma: bool):
+    """Modal's cluster decorator: `modal.clustered` from 1.6, else the
+    experimental name it replaced (same arguments)."""
+    clustered = getattr(modal, "clustered", None)
+    if clustered is None:
+        clustered = modal.experimental.clustered
+    return clustered(size=size, rdma=rdma)
+
+
+def cluster_rank_and_ips() -> tuple[int, list[str]]:
+    """This container's rank and every container's IP, inside a clustered call.
+
+    IPv4 only (NIXL's side channel and UCX's sockaddr use it): an empty list raises,
+    with no fallback to the IPv6 list.
+    """
+    import modal.experimental
+
+    info = modal.experimental.get_cluster_info()
+    ips = list(getattr(info, "container_ipv4_ips", None) or [])
+    if not ips:
+        raise RunError(
+            "Modal gave this cluster no IPv4 container addresses (container_ipv4_ips is "
+            "empty); NIXL's side channel and UCX need IPv4, so the run cannot continue"
+        )
+    return int(info.rank), ips
 
 
 def _local_secret(names: tuple[str, ...]) -> modal.Secret:
@@ -216,9 +245,14 @@ def run(
     prepared = _prepared(exp, prepared)
 
     local_dir = _local_destination(exp.output, run_name)
+    cluster = (
+        f" nodes={exp.nodes} rdma={exp.rdma} bench_rank={exp.bench_rank_resolved}"
+        if exp.clustered
+        else ""
+    )
     print(
         f"submitting to Modal: gpu={exp.gpu} image={exp.image or exp.dockerfile} "
-        f"fingerprint={prepared.fingerprint} volume={VOLUME_NAME}",
+        f"fingerprint={prepared.fingerprint} volume={VOLUME_NAME}{cluster}",
         flush=True,
     )
     if detach:
@@ -246,36 +280,57 @@ def run(
     image = build_image(exp, prepared)
     info_text = prepared.info_text(exp)
 
-    @app.function(
-        image=image,
-        gpu=exp.gpu,
-        timeout=int(exp.timeout_seconds) + MODAL_TIMEOUT_BUFFER_SECONDS,
-        volumes=volumes,
-        secrets=_runtime_secrets(exp),
-        serialized=True,
-    )
     def remote(mapping: dict, config_text: str, run_name: str, info_text: str) -> None:
         # Imports stay inside the function so the container only needs modelsight
         # and the standard library, not the client's CLI dependencies.
         from pathlib import Path
 
         from modelsight.config import experiment_from_mapping
-        from modelsight.runner import commit_with_timeout, execute_run
+        from modelsight.runner import commit_with_timeout, execute_cluster_run, execute_run
 
         experiment = experiment_from_mapping(mapping)
-        try:
-            execute_run(
-                experiment,
-                Path(RESULTS_MOUNT) / run_name,
-                config_text,
-                extra_env=info_text,
-            )
-        finally:
+        run_dir = Path(RESULTS_MOUNT) / run_name
+        committed: list[bool] = []
+
+        def commit_all() -> None:
             # The results first, then the cache. Each commit is bounded and timed so
-            # a slow one cannot keep the GPUs idle once the run is over.
+            # a slow one cannot keep the GPUs idle once the run is over. Once only.
+            if committed:
+                return
+            committed.append(True)
             for label, mounted in (("results", volume), ("cache", cache_volume)):
                 if mounted is not None:
                     commit_with_timeout(label, mounted)
+
+        try:
+            if experiment.clustered:
+                # Every rank gets the same call (inputs are broadcast).
+                from modelsight.targets.modal import cluster_rank_and_ips
+
+                rank, ips = cluster_rank_and_ips()
+                # finalize commits before the rank reports `committed`, and rank 0
+                # returns only after the bench rank has, so the client's download
+                # (after the call returns) sees every rank's files.
+                execute_cluster_run(
+                    experiment, run_dir, config_text, rank, ips, extra_env=info_text,
+                    finalize=commit_all,
+                )
+            else:
+                execute_run(experiment, run_dir, config_text, extra_env=info_text)
+        finally:
+            commit_all()
+
+    if exp.clustered:
+        # Applied below app.function, as Modal requires.
+        remote = cluster_decorator(exp.nodes, exp.rdma)(remote)
+    remote = app.function(
+        image=image,
+        gpu=exp.gpu,
+        timeout=int(exp.timeout_seconds) + MODAL_TIMEOUT_BUFFER_SECONDS,
+        volumes=volumes,
+        secrets=_runtime_secrets(exp),
+        serialized=True,
+    )(remote)
 
     state = None
     try:

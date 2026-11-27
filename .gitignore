@@ -11,3 +11,5 @@ interpretation/
 PLAN.md
 # ms: saved detached runs
 .ms/
+# vLLM overlays packed by examples/kv-transfer/prepare_local_vllm.sh
+examples/kv-transfer/local_vllm*.tar.gz

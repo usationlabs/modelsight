@@ -162,12 +162,16 @@ def dry_run_report(
         f"image: {exp.image or '-'}",
         f"output: {output / name}/",
         f"ready_url: {exp.ready_url}",
+        *[f"ready_urls: {url}" for url in exp.ready_urls],
         f"ready_timeout: {exp.ready_timeout}",
         f"timeout: {exp.timeout}",
         f"server: {exp.server}",
         f"bench: {exp.bench}",
         f"aiperf: {aiperf_status(exp)}",
     ]
+    if exp.clustered:
+        lines.insert(4, f"nodes: {exp.nodes} (rdma: {'yes' if exp.rdma else 'no'}, "
+                        f"bench rank: {exp.bench_rank_resolved})")  # fmt: skip
     if prepared is not None:
         lines.extend(_image_lines(exp, prepared))
     return "\n".join(lines)

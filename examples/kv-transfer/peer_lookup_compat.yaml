@@ -1,0 +1,116 @@
+# SCRATCH, not committed. Does the peer lookup capability probe protect an old
+# engine, on real engines? Validates the review fixes of
+# usationlabs/vllm#1 / vllm-project/vllm#68430 before they are pushed.
+#
+# Four engines of Qwen3-0.6B on two A100-80GB GPUs. The three producers share
+# GPU 0 (0.2 of memory each) and CONS has GPU 1 to itself, so the NIXL hit
+# crosses GPUs (cuda_ipc), as in the earlier validated runs:
+#
+#   OLD   stock upstream main (/opt/venv-main): no peer lookup, and the
+#         listener that dies on a LOOKUP_PIN frame
+#   NEWD  the review-fix build, peer_lookup off (advertises False)
+#   NEWP  the review-fix build, peer_lookup on  (advertises True)
+#   CONS  the review-fix build, the consumer
+#
+# CONS gets a request with peer_lookup and each producer's address, after that
+# producer was warmed with the prompt. Against OLD and NEWD it must compute
+# locally with the miss reason peer_unsupported, send no LOOKUP_PIN, move no
+# NIXL bytes, return the same tokens as its own recompute, and the producer's
+# GET_META listener must still answer. Against NEWP it must hit, move bytes and
+# return the same tokens. --control then sends a raw LOOKUP_PIN frame to OLD and
+# reports whether its listener stops answering (informational).
+#
+# The vLLM build is the local worktree, not a git ref: prepare_local_vllm.sh
+# packs the files that differ from upstream main into ./local_vllm.tar.gz, which the
+# Dockerfile lays over a precompiled upstream-main install.
+#
+# Prepare, with no GPU:
+#   examples/kv-transfer/prepare_local_vllm.sh
+#   uv run ms build -f examples/kv-transfer/peer_lookup_compat.yaml
+# Run, with streamed logs:
+#   uv run ms run -f examples/kv-transfer/peer_lookup_compat.yaml --detach
+target: modal
+gpu: A100-80GB:2
+dockerfile: Dockerfile.peer_lookup_compat
+sources:
+  VLLM:
+    repo: https://github.com/vllm-project/vllm
+    # upstream main 9df94b9977, the merge base of the review-fix branch
+    ref: 9df94b99774f1a0e17716f26dbb4eac50cc66f7a
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [Qwen/Qwen3-0.6B]
+
+ready_url: http://localhost:8200/health
+ready_timeout: 20m
+timeout: 40m
+
+report:
+  - cat /opt/vllm-tests/HEAD_SHA
+  - /opt/venv-main/bin/pip list 2>/dev/null | grep -i -E '^(vllm|nixl) '
+  - /opt/venv/bin/pip list 2>/dev/null | grep -i -E '^(vllm|nixl) '
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+
+# Engines start one after another, so their memory checks do not race on the
+# shared GPU. Lines are tagged [OLD], [NEWD], [NEWP] or [CONS].
+server: |
+  bash <<'EOF2'
+  export PYTHONPATH=/opt/nixl-error-mode
+  export VLLM_SERVER_DEV_MODE=1
+  # The same block hashes on every engine.
+  export PYTHONHASHSEED=0
+  export UCX_RCACHE_MAX_UNRELEASED=1024 UCX_PROTO_INFO=y
+
+  # The peer lookup modules log at DEBUG: B logs "Peer lookup for <id> missed:
+  # <reason>" or "Peer lookup_pin hit for <id>", A logs each lookup.
+  cat > /tmp/vllm-logging.json <<'JSON'
+  {
+    "version": 1,
+    "disable_existing_loggers": false,
+    "formatters": {"vllm": {"()": "vllm.logging_utils.NewLineFormatter",
+      "datefmt": "%m-%d %H:%M:%S",
+      "format": "(%(vllm_process_name)s pid=%(process)d) %(levelname)s %(asctime)s.%(msecs)03d [%(fileinfo)s:%(lineno)d] %(message)s"}},
+    "handlers": {"vllm": {"class": "logging.StreamHandler", "formatter": "vllm",
+      "level": "DEBUG", "stream": "ext://sys.stdout"}},
+    "loggers": {
+      "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": false},
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.peer_pins": {"level": "DEBUG"},
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.peer_lookup_client": {"level": "DEBUG"},
+      "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler": {"level": "DEBUG"}
+    }
+  }
+  JSON
+  export VLLM_LOGGING_CONFIG_PATH=/tmp/vllm-logging.json
+
+  # serve NAME GPU PORT SIDE_CHANNEL_PORT VLLM_BIN KV_CONNECTOR_EXTRA_CONFIG
+  # --no-enable-extensible-kv-cache keeps KV readable over cuda_ipc.
+  serve() {
+    CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 stdbuf -oL $5 serve Qwen/Qwen3-0.6B \
+      --port $3 \
+      --max-model-len 8192 \
+      --gpu-memory-utilization 0.2 \
+      --enable-prefix-caching \
+      --prefix-caching-hash-algo sha256 \
+      --no-enable-extensible-kv-cache \
+      --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":$6}" \
+      2>&1 | tee /tmp/server-$1.log | sed -u "s/^/[$1] /" &
+    until curl -sf localhost:$3/health; do sleep 2; done
+  }
+
+  serve OLD  0 8100 5600 /opt/venv-main/bin/vllm '{}'
+  serve NEWD 0 8110 5602 /opt/venv/bin/vllm      '{}'
+  serve NEWP 0 8120 5603 /opt/venv/bin/vllm      '{"peer_lookup":true}'
+  serve CONS 1 8200 5601 /opt/venv/bin/vllm      '{"peer_lookup":true}'
+  wait -n
+  EOF2
+
+# The container mounts modelsight at /root/modelsight.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_peer_compat
+  --model Qwen/Qwen3-0.6B
+  --old http://localhost:8100 --old-log /tmp/server-OLD.log
+  --unadvertised http://localhost:8110 --unadvertised-log /tmp/server-NEWD.log
+  --new http://localhost:8120 --new-log /tmp/server-NEWP.log
+  --consumer http://localhost:8200 --consumer-log /tmp/server-CONS.log
+  --control

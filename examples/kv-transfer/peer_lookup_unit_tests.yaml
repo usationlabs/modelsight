@@ -1,0 +1,54 @@
+# SCRATCH, not committed. The peer lookup-and-pin unit tests on a real GPU box.
+#
+# Runs the PR's tests in the image built from the local review-fix worktree
+# (Dockerfile.peer_lookup_compat), where vLLM can infer its device. On a Mac
+# the 30 tests of test_nixl_remote_read_expiry.py that build a VllmConfig, the
+# lease/heartbeat tests, and test_nixl_connector.py cannot run. No server is
+# needed; a trivial one satisfies ms.
+#
+# Prepare, with no GPU:
+#   examples/kv-transfer/prepare_local_vllm.sh
+#   uv run ms build -f examples/kv-transfer/peer_lookup_unit_tests.yaml
+# Run:
+#   uv run ms run -f examples/kv-transfer/peer_lookup_unit_tests.yaml --detach
+target: modal
+# The tests use opt-125m / Qwen3-0.6B and no A100-only kernels, so an L4 (24 GB)
+# is enough.
+gpu: L4
+dockerfile: Dockerfile.peer_lookup_compat
+sources:
+  VLLM:
+    repo: https://github.com/vllm-project/vllm
+    # upstream main 9df94b9977, the merge base of the review-fix branch
+    ref: 9df94b99774f1a0e17716f26dbb4eac50cc66f7a
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [facebook/opt-125m, facebook/opt-350m, Qwen/Qwen3-0.6B]
+
+ready_url: http://localhost:8000/
+ready_timeout: 5m
+timeout: 45m
+
+report:
+  - cat /opt/vllm-tests/HEAD_SHA
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch|pytest|ray) '
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+
+server: python -m http.server 8000 --bind 127.0.0.1
+
+# Run from the tests' root so `tests.v1...` imports resolve; vllm itself is the
+# installed package with the review-fix files copied over it.
+bench: >-
+  cd /opt/vllm-tests && PYTHONPATH=/opt/nixl-error-mode:/opt/vllm-tests
+  python -m pytest -q -p no:cacheprovider
+  tests/v1/core/test_prefix_pin.py
+  tests/v1/kv_connector/unit/test_nixl_peer_pins.py
+  tests/v1/kv_connector/unit/test_nixl_peer_lookup_client.py
+  tests/v1/kv_connector/unit/test_nixl_peer_lookup_listener.py
+  tests/v1/kv_connector/unit/test_nixl_peer_lookup_consumer.py
+  tests/v1/kv_connector/unit/test_nixl_peer_lookup_info.py
+  tests/v1/kv_connector/unit/test_nixl_remote_read_expiry.py
+  tests/v1/kv_connector/unit/test_nixl_connector.py
+  tests/v1/core/test_prefix_caching.py
+  2>&1 | tee pytest.log

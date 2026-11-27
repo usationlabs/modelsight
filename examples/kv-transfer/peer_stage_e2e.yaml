@@ -1,0 +1,159 @@
+# SCRATCH, not committed. Does vLLM's peer stage work end to end? When a NIXL peer
+# lookup (B asks A to pin a prefix by hash) hits blocks that are only in A's CPU
+# offload cache, A copies them into GPU blocks before it replies, and falls back
+# (trims the pin to the GPU run) on a deadline or a failed copy. Design:
+# design/vllm/peer-pin-cpu-stage-fallback.md, section 4 "End to end on Modal",
+# the "M0 result" and open question 3 (the skip rule). Code: the feat/nixl-peer-stage
+# branch of usationlabs/vllm (worktree /Users/bashorun/usation/vllm-peer-stage).
+#
+# Four engines of Qwen3-0.6B on two H100 GPUs, each MultiConnector(NixlConnector,
+# OffloadingConnector with a CPU tier). The three A engines share GPU 0 (0.1 of memory
+# each; the pool is overridden to 1024 blocks, so a prefix spills to CPU) and B has
+# GPU 1, so the hit crosses GPUs (cuda_ipc):
+#
+#   A       peer_lookup + peer_stage, peer_stage_deadline 3.0 (above B's lookup
+#           timeout minus the margin, so a budget-derived deadline is
+#           distinguishable from the configured one), recompute rate 0 (the skip
+#           rule off, or the small 0.6B prompts would all be skipped)
+#   A_DL    like A, peer_stage_deadline 0.3 (above the pin server's own copy
+#           estimate, 2 steps + bytes / 20 GB/s, which skips a copy that cannot
+#           make a shorter one); the probe arms slow_loads_s so a copy misses it
+#   A_SKIP  like A, peer_stage_recompute_tokens_per_s 1e9 (the skip-rule check)
+#   B       peer_lookup only: the consumer
+#
+# Seven scenarios (probes/kv_peer_stage.py has each one's checks): cpu_only, mixed
+# (GPU / CPU / GPU), deadline_trim, load_failure, older_consumer, engine_idle,
+# skip_rule. Each: B's tokens equal its recompute, NIXL bytes moved, a successful
+# A prefix-cache reset at the end, and A's `Peer stage ...` log lines by pin.
+#
+# Test hooks (no flag in vLLM): probes/peer_stage_hook/sitecustomize.py, on
+# PYTHONPATH of every engine and armed per engine through /tmp/ctl-<NAME>.json:
+# one-shot partial GPU eviction (the GPU / CPU / GPU layout), failed and delayed
+# CPU->GPU load jobs on A, and on B dropping reply_budget_s (an older consumer)
+# plus tagged lines of each lookup reply. See the probe's docstring for which
+# scenarios are plain traffic and which are approximated.
+#
+# The vLLM build is the local worktree, not a git ref: prepare_local_vllm.sh packs
+# the files that differ from upstream main 3332daf8fe (the commit the branch last
+# merged; NOT 9df94b9977, the base of the peer_lookup runs, whose wheel differs in
+# csrc) into ./local_vllm_peer_stage.tar.gz, which Dockerfile.peer_stage lays over
+# that commit's precompiled install.
+#
+# Prepare, with no GPU, from the repo root (re-run it whenever the branch changes):
+#   examples/kv-transfer/prepare_local_vllm.sh /Users/bashorun/usation/vllm-peer-stage \
+#       3332daf8fe613c0e3d7c06f42b12e95eb450aa1e local_vllm_peer_stage.tar.gz
+#   uv run ms build -f examples/kv-transfer/peer_stage_e2e.yaml
+# Run, with streamed logs:
+#   uv run ms run -f examples/kv-transfer/peer_stage_e2e.yaml --detach
+#
+# Memory: the CPU tiers pin 6 + 2 + 2 + 2 GiB of host memory; lower CPU_* below if
+# an engine dies at startup. The shared knobs (deadline 3.0 / 0.3, slow load 1.2 s)
+# are repeated in the bench's arguments: keep them in step.
+target: modal
+gpu: H100:2
+dockerfile: Dockerfile.peer_stage
+sources:
+  VLLM:
+    repo: https://github.com/vllm-project/vllm
+    # upstream main 3332daf8fe, the last upstream commit the branch merged
+    ref: 3332daf8fe613c0e3d7c06f42b12e95eb450aa1e
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [Qwen/Qwen3-0.6B]
+
+ready_url: http://localhost:8200/health
+ready_timeout: 30m
+timeout: 60m
+
+report:
+  - cat /opt/vllm-tests/HEAD_SHA
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl) '
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - free -g
+
+# Engines start one after another, so their memory checks do not race on the
+# shared GPU. Lines are tagged [A], [A_DL], [A_SKIP] or [B]; each log is also
+# /tmp/server-<NAME>.log, untagged, which the probe reads.
+server: |
+  bash <<'EOF2'
+  export VLLM_SERVER_DEV_MODE=1
+  # The same block hashes on every engine.
+  export PYTHONHASHSEED=0
+  export UCX_RCACHE_MAX_UNRELEASED=1024 UCX_PROTO_INFO=y
+  # The hook shadows the image's sitecustomize and loads it (UCX error mode).
+  export PYTHONPATH=/root/modelsight/probes/peer_stage_hook
+
+  # Debug logging of the modules the checks read: the pin server (the `Peer stage
+  # ...` and `Peer lookup_pin pinned` lines), B's lookup scheduler and client, and
+  # the stage source. Set LOG_ALL=1 for vLLM's DEBUG everywhere if a line is
+  # missing (a lot of output: NIXL logs every request's kv_transfer_params).
+  LOG_ALL=0
+  V1=vllm.distributed.kv_transfer.kv_connector.v1
+  if [ "$LOG_ALL" = 1 ]; then VLLM_LEVEL=DEBUG; else VLLM_LEVEL=INFO; fi
+  cat > /tmp/vllm-logging.json <<JSON
+  {
+    "version": 1,
+    "disable_existing_loggers": false,
+    "formatters": {"vllm": {"()": "vllm.logging_utils.NewLineFormatter",
+      "datefmt": "%m-%d %H:%M:%S",
+      "format": "(%(vllm_process_name)s pid=%(process)d) %(levelname)s %(asctime)s.%(msecs)03d [%(fileinfo)s:%(lineno)d] %(message)s"}},
+    "handlers": {"vllm": {"class": "logging.StreamHandler", "formatter": "vllm",
+      "level": "DEBUG", "stream": "ext://sys.stdout"}},
+    "loggers": {
+      "vllm": {"handlers": ["vllm"], "level": "$VLLM_LEVEL", "propagate": false},
+      "$V1.nixl.peer_pins": {"level": "DEBUG"},
+      "$V1.nixl.peer_lookup_client": {"level": "DEBUG"},
+      "$V1.nixl.pull_scheduler": {"level": "DEBUG"},
+      "$V1.peer_stage": {"level": "DEBUG"},
+      "$V1.offloading.scheduler": {"level": "DEBUG"}
+    }
+  }
+  JSON
+  export VLLM_LOGGING_CONFIG_PATH=/tmp/vllm-logging.json
+
+  # serve NAME GPU PORT SIDE_CHANNEL_PORT MEM_FRACTION GPU_BLOCKS CPU_BYTES NIXL_EXTRA_CONFIG
+  # GPU_BLOCKS 0 keeps the computed pool. --no-enable-extensible-kv-cache keeps KV
+  # readable over cuda_ipc. kv_load_failure_policy "fail" as in the compat run.
+  serve() {
+    local override=""
+    [ "$6" != 0 ] && override="--num-gpu-blocks-override $6"
+    local cfg="{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"connectors\":[{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":$8},{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$7}}]}}"
+    echo '{}' > /tmp/ctl-$1.json
+    PEER_STAGE_CTL=/tmp/ctl-$1.json CUDA_VISIBLE_DEVICES=$2 VLLM_NIXL_SIDE_CHANNEL_PORT=$4 \
+      stdbuf -oL vllm serve Qwen/Qwen3-0.6B \
+      --port $3 \
+      --max-model-len 8192 \
+      --gpu-memory-utilization $5 \
+      $override \
+      --enable-prefix-caching \
+      --prefix-caching-hash-algo sha256 \
+      --block-size 16 \
+      --no-enable-extensible-kv-cache \
+      --kv-transfer-config "$cfg" \
+      2>&1 | tee /tmp/server-$1.log | sed -u "s/^/[$1] /" &
+    until curl -sf localhost:$3/health; do sleep 2; done
+  }
+
+  GIB=1073741824
+  CPU_A=$((6 * GIB)); CPU_SMALL=$((2 * GIB))
+  STAGE='"peer_lookup":true,"peer_stage":true,"peer_stage_max_fraction":0.25'
+  serve A      0 8100 5600 0.1 1024 $CPU_A     "{$STAGE,\"peer_stage_deadline\":3.0,\"peer_stage_recompute_tokens_per_s\":0}"
+  serve A_DL   0 8110 5602 0.1 1024 $CPU_SMALL "{$STAGE,\"peer_stage_deadline\":0.3,\"peer_stage_recompute_tokens_per_s\":0}"
+  serve A_SKIP 0 8120 5603 0.1 1024 $CPU_SMALL "{$STAGE,\"peer_stage_deadline\":3.0,\"peer_stage_recompute_tokens_per_s\":1000000000}"
+  serve B      1 8200 5601 0.2 0    $CPU_SMALL '{"peer_lookup":true}'
+  wait -n
+  EOF2
+
+# The container mounts modelsight at /root/modelsight. Keep --stage-deadline,
+# --deadline and --slow-load-s in step with the servers above.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_peer_stage
+  --model Qwen/Qwen3-0.6B
+  --a http://localhost:8100 /tmp/server-A.log /tmp/ctl-A.json
+  --a-deadline http://localhost:8110 /tmp/server-A_DL.log /tmp/ctl-A_DL.json
+  --a-skip http://localhost:8120 /tmp/server-A_SKIP.log /tmp/ctl-A_SKIP.json
+  --b http://localhost:8200 /tmp/server-B.log /tmp/ctl-B.json
+  --stage-deadline 3.0
+  --deadline 0.3
+  --slow-load-s 1.2
