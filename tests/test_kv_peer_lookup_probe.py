@@ -147,7 +147,7 @@ class FakeVllm:
             f"vllm:num_requests_running {running}\n"
             "vllm:num_requests_waiting 0\n"
             f"vllm:kv_offload_store_bytes_total {self.store_bytes}\n"
-            f'vllm:cache_config_info{{block_size="{self.block_size}",num_gpu_blocks="100"}} 1\n'
+            f'vllm:cache_config_info{{block_size="{self.block_size}",num_gpu_blocks="10000"}} 1\n'
             f'vllm:nixl_bytes_transferred_count{{m="q"}} {self.transfers}\n'
             f'vllm:nixl_bytes_transferred_sum{{m="q"}} {self.bytes}\n'
             f'vllm:request_success_total{{m="q",reason="stop"}} {self.served}\n'

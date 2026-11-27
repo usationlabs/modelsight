@@ -48,7 +48,7 @@ bench: >-
   --consumer-log $MS_RUN_DIR/rank-0/server-B.log
   --levels 0,32
   --sessions 2
-  --batch-sessions 0
+  --cpu-gb 100
   --max-prompt-tokens 30000
   --level-seconds 600
   --output smoke/results.json

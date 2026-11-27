@@ -295,9 +295,126 @@ def test_prepare_without_cpu_cases_never_resets():
     assert [c[0] for c in a.calls] == ["warm"]
 
 
-def test_batches_split_the_sessions():
-    assert h6.batches_of([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]
-    assert h6.batches_of([1, 2], 0) == h6.batches_of([1, 2], 5) == [[1, 2]]
+# The smoke run (A100-80GB x2): A's pool held 398,768 tokens, its CPU tier 100 GiB, and
+# the two measured sessions had prompts of 26,947 and 14,903 tokens. All four stateful
+# arms' states for both sessions, in one batch, were 418k GPU tokens (more than the
+# pool, so the first-warmed states were evicted before measurement: gpu became partial
+# or cpu) and 670k CPU tokens, which with the load's 86 GB of stores overran the tier
+# (cpu became miss at level 32).
+SMOKE_POOL = 398_768
+SMOKE_CPU = 100 * 2**30 / 147_456
+SMOKE_PAIRS = [(0, list(range(26_700)), list(range(26_947))),
+               (1, list(range(14_800)), list(range(14_903)))]  # fmt: skip
+FOUR_ARMS = ["stock", "peer", "peer_stage", "on_a"]
+
+
+def unit_cost(unit, arms=FOUR_ARMS, block=16) -> tuple[int, int]:
+    pairs, cases = unit
+    parts = [h6.state_tokens(p, c, case, block, len(arms)) for _, p, c in pairs for case in cases]
+    return sum(g for g, _ in parts), sum(c for _, c in parts)
+
+
+def test_the_smoke_runs_one_batch_overran_a_and_units_fit_its_budgets():
+    whole = unit_cost((SMOKE_PAIRS, list(h6.CASES)))
+    assert whole[0] > SMOKE_POOL and whole[1] > 600_000  # the cause of the drift
+
+    gpu_budget = (SMOKE_POOL - 128_000) * h6.GPU_STATE_FRACTION  # a loaded level
+    cpu_budget = SMOKE_CPU * h6.CPU_STATE_FRACTION
+    units = h6.plan_units(SMOKE_PAIRS, list(h6.CASES), FOUR_ARMS, 16, gpu_budget, cpu_budget)
+
+    assert len(units) > 2
+    covered = sorted((n, c) for pairs, cases in units for n, _, _ in pairs for c in cases)
+    assert covered == sorted((n, c) for n in (0, 1) for c in h6.CASES)  # each exactly once
+    for unit in units:
+        gpu, cpu = unit_cost(unit)
+        single = len(unit[0]) * len(unit[1]) == 1  # one that cannot be split further
+        assert single or (gpu <= gpu_budget and cpu <= cpu_budget)
+    # at level 0 the pool is all A's, so fewer and bigger units
+    idle = h6.plan_units(SMOKE_PAIRS, list(h6.CASES), FOUR_ARMS, 16, SMOKE_POOL * 0.5, cpu_budget)
+    assert len(idle) < len(units)
+
+
+def test_units_without_budgets_or_with_a_session_cap():
+    pairs = [(n, [1] * 32, [1] * 64) for n in range(5)]
+    assert len(h6.plan_units(pairs, ["gpu", "cpu"], FOUR_ARMS, 16, None, None)) == 1
+    capped = h6.plan_units(pairs, ["gpu", "cpu"], FOUR_ARMS, 16, None, None, max_sessions=2)
+    assert [len(p) for p, _ in capped] == [2, 2, 1]
+    assert h6.state_tokens([1] * 32, [1] * 64, "cpu", 16, 2) == (0, 128)  # CPU only
+    assert h6.state_tokens([1] * 32, [1] * 64, "cpu_tail", 16, 1) == (32, 64)  # head on GPU
+
+
+def test_budgets_come_from_a_pool_less_the_load_and_the_cpu_tier(fakes, tmp_path):
+    producer, _ = fakes
+    argv = h6.parse_args(args(fakes, tmp_path))
+
+    idle, cpu = h6.state_budgets(argv, producer.url, 0)
+    loaded, _ = h6.state_budgets(argv, producer.url, 8)
+
+    assert idle == 10000 * BLOCK * h6.GPU_STATE_FRACTION  # the fake: 10000 blocks of 4 tokens
+    assert loaded == 0.0  # 128k load tokens exceed the fake's tiny pool: one item per unit
+    assert cpu == argv.cpu_gb * 2**30 / BYTES_PER_TOKEN * h6.CPU_STATE_FRACTION
+
+
+def sampler(rows) -> "h6.MetricsSampler":
+    s = h6.MetricsSampler("http://unused", 1)
+    s.rows = [{"t": t, "steps": n, "running": r, "held": None, "preemptions": 0, "free": None}
+              for t, n, r in rows]  # fmt: skip
+    return s
+
+
+def test_step_interval_is_the_gap_between_steps_while_a_is_busy():
+    busy = sampler([(i * 0.25, i * 10, 15) for i in range(20)])  # 10 steps per 0.25 s
+    assert h6.MetricsSampler.step_ms(busy, 5.0) == pytest.approx(25.0)
+
+    # An idle A takes a step only when our own request arrives. The old
+    # (last - first) / steps gave 1199 ms here; with nothing running it is 0:
+    # the estimate is the copy alone, as vLLM's own (an idle gap drops its average).
+    idle = sampler([(0.0, 100, 0), (1.5, 100, 0), (3.0, 100, 0), (4.5, 101, 0), (6.0, 101, 0)])
+    assert h6.MetricsSampler.step_ms(idle, 10.0) == 0.0
+    # steps that happen with requests running count; a gap over 2 s is an idle gap
+    mixed = sampler([(0.0, 0, 0), (3.0, 5, 1), (3.25, 15, 1), (3.5, 25, 1), (7.0, 25, 0)])
+    assert h6.MetricsSampler.step_ms(mixed, 10.0) == pytest.approx(25.0)
+    assert h6.MetricsSampler.step_ms(sampler([]), 10.0) is None
+    no_series = sampler([(0.0, None, 1), (1.0, None, 1)])
+    assert h6.MetricsSampler.step_ms(no_series, 10.0) is None
+
+
+def test_the_estimate_is_vllms_two_steps_plus_bytes_over_20_gbps():
+    staged = {"skip_est_s": None}
+    est, source = h6.a_estimate(staged, 26_944, 20.0, 147_456)
+    assert source == "model"
+    assert est == pytest.approx(2 * 0.020 + 26_944 * 147_456 / 20e9)  # 0.239 s
+    idle, _ = h6.a_estimate(staged, 26_944, 0.0, 147_456)  # an idle A: the copy alone
+    assert idle == pytest.approx(26_944 * 147_456 / 20e9)
+    assert h6.a_estimate({"skip_est_s": 0.912}, 100, 20.0, 147_456) == (0.912, "log")
+    assert h6.a_estimate(staged, 0, 20.0, 147_456) == (None, "none")
+
+
+@pytest.mark.parametrize("est,tokens,rate,deadline,skip", [
+    (0.24, 26_944, 10_000, 1.5, False),  # a 2.7 s recompute beats a 0.24 s copy
+    (0.24, 1_000, 10_000, 1.5, True),  # but 1,000 tokens recompute in 0.1 s
+    (1.6, 26_944, 10_000, 1.5, True),  # over the deadline: skip whatever B would take
+    (1.6, 26_944, 0, 1.5, True),
+    (0.24, 1_000, 0, 1.5, False),  # rate 0 turns the recompute half off
+])  # fmt: skip
+def test_skip_rule_matches_vllms(est, tokens, rate, deadline, skip):
+    assert h6.would_skip(est, tokens, rate, deadline) is skip
+
+
+def test_offline_scoring_with_the_smoke_numbers_skips_no_winners():
+    # level 0 (idle A) and level 32 (step 20 ms), measured peer vs peer_stage TTFT
+    def rec(level, cpu, peer, staged, step):
+        est, _ = h6.a_estimate({"skip_est_s": None}, cpu, step, 147_456)
+        return stage_record(level, cpu, peer, staged, est=est, step=step)
+
+    records = [rec(0, 26_944, 2.94, 0.68, 0.0), rec(0, 14_896, 1.34, 0.39, 0.0),
+               rec(32, 26_944, 2.94, 0.64, 20.0), rec(32, 14_896, 1.36, 0.51, 20.0)]  # fmt: skip
+
+    score = h6.score_offline(records, 10_000)
+
+    assert score["skipped_winners"] == 0 and score["right"] == score["of"] == 4
+    # at an absurd rate the rule skips everything: and every skip is a winner lost
+    assert h6.score_offline(records, 1e9)["skipped_winners"] == 4
 
 
 # Tables and verdicts -----------------------------------------------------------------------
@@ -497,6 +614,8 @@ def test_sweep_end_to_end(fakes, tmp_path):
     records = [r for r in result["records"]]
     assert {r["level"] for r in records} == {0, 2}
     by_case = {r["case"]: r for r in records if r["level"] == 0}
+    # least-churn cases first, so a copy or a load does not evict states still waiting
+    assert [r["case"] for r in records if r["level"] == 0] == ["gpu", "cpu_tail", "cpu", "miss"]
     # A's log, not the intent, decides: cpu really was CPU-only and was staged
     assert by_case["cpu"]["location_actual"] == "cpu" and by_case["cpu"]["cpu_tokens"] > 0
     assert by_case["cpu"]["peer_stage"]["outcome"] == "staged"

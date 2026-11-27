@@ -116,11 +116,18 @@ PART_DEFAULTS = {
 }  # fmt: skip
 SIZE_EDGES = (4000, 8000, 16000, 32000)
 STAGE_RATE_BYTES_PER_S = 20e9  # the pin server's copy bandwidth in its estimate
+# Share of A's GPU pool, and of its CPU tier, that one batch's prepared states may fill.
+# The measurements themselves allocate on A (a staged copy, a load into GPU), and the
+# AIPerf load stores to the CPU tier, so the rest is headroom against LRU eviction.
+GPU_STATE_FRACTION = 0.5
+CPU_STATE_FRACTION = 0.5
+MEASURE_ORDER = ("gpu", "partial", "cpu_tail", "cpu", "miss")  # least churn on A first
 DEFAULT_DEADLINE_S = 1.5
 STAGE_SETTLE_SECONDS = 10.0
 STORE_STABLE_SECONDS = 2.0
 STORE_TIMEOUT_SECONDS = 300.0
 STEP_WINDOW_SECONDS = 10.0
+IDLE_GAP_S = 2.0  # vLLM peer_pins._IDLE_GAP_S: a longer step gap means A idled
 SAMPLE_INTERVAL_SECONDS = 0.25
 END_RESET_ATTEMPTS = 60
 LOG_TIMEOUT_SECONDS = 20.0
@@ -459,7 +466,7 @@ class MetricsSampler(h5.Sampler):
                 self.samples.append((now, metrics.get("vllm:num_requests_running", 0.0),
                                      metrics.get("vllm:num_requests_waiting", 0.0)))  # fmt: skip
                 self.rows.append({
-                    "t": now, "steps": steps, "held": sum(held) if held else None,
+                    "t": now, "steps": steps, "running": metrics.get("vllm:num_requests_running", 0.0), "held": sum(held) if held else None,
                     "preemptions": counter(metrics, "vllm:num_preemptions"),
                     "free": (1 - usage) * blocks if usage is not None and blocks else None,
                 })  # fmt: skip
@@ -471,10 +478,24 @@ class MetricsSampler(h5.Sampler):
         return [r for r in list(self.rows) if start <= r["t"] <= end]
 
     def step_ms(self, end: float, span: float = STEP_WINDOW_SECONDS) -> float | None:
+        """A's engine step interval over the last `span` seconds, as the pin server's
+        own estimate sees it: gaps between consecutive steps, only while A has
+        running requests and only gaps within IDLE_GAP_S (a longer one means A
+        idled; vLLM drops its average then). Median of the per-sample gaps. An idle
+        A returns 0.0, so the estimate is the copy alone; None means no step
+        counter is exposed at all."""
         rows = [r for r in self._span(end - span, end) if r["steps"] is not None]
-        if len(rows) < 2 or rows[-1]["steps"] <= rows[0]["steps"]:
+        if not rows:
             return None
-        return (rows[-1]["t"] - rows[0]["t"]) / (rows[-1]["steps"] - rows[0]["steps"]) * 1000
+        gaps = []
+        for before, after in zip(rows, rows[1:]):
+            steps = after["steps"] - before["steps"]
+            busy = (before["running"] or 0) > 0 or (after["running"] or 0) > 0
+            if steps > 0 and busy:
+                gap = (after["t"] - before["t"]) / steps
+                if gap <= IDLE_GAP_S:
+                    gaps.append(gap)
+        return statistics.median(gaps) * 1000 if gaps else 0.0
 
     def free_blocks_min(self, start: float, end: float) -> float | None:
         free = [r["free"] for r in self._span(start, end) if r["free"] is not None]
@@ -663,10 +684,67 @@ def stock_arm(ctx: Ctx, salt: str, current: list[int]) -> dict:
 # Levels ---------------------------------------------------------------------
 
 
-def batches_of(pairs: list, size: int) -> list[list]:
-    if size <= 0 or size >= len(pairs):
-        return [pairs]
-    return [pairs[i : i + size] for i in range(0, len(pairs), size)]
+def state_tokens(previous: list[int], current: list[int], case: str, block_size: int,
+                 arms: int) -> tuple[int, int]:  # fmt: skip
+    """(GPU tokens, CPU tokens) one session's case state takes on A, over `arms`
+    states. Every warm-up is stored to the CPU tier; the GPU keeps what is warmed
+    after the reset (a cpu state keeps none there)."""
+    full = len(current) // block_size * block_size
+    prev = len(previous) // block_size * block_size
+    gpu, cpu = {"gpu": (full, full), "partial": (prev, prev), "cpu": (0, full),
+                "cpu_tail": (full // 2, full), "miss": (0, 0)}[case]  # fmt: skip
+    return gpu * arms, cpu * arms
+
+
+def plan_units(pairs: list, cases: list[str], arms: list[str], block_size: int,
+               gpu_budget: float | None, cpu_budget: float | None,
+               max_sessions: int = 0) -> list[tuple[list, list[str]]]:  # fmt: skip
+    """Split a level's sessions and cases into units (sessions x cases) whose states
+    fit A's GPU pool and CPU tier, so a unit's prepared states are still there when
+    it is measured. A session whose cases do not fit together is split by case; a
+    single (session, case) that does not fit still gets a unit of its own. No budget
+    (None) means no limit; `max_sessions` caps the sessions of a unit."""
+    n_arms = len([a for a in STATEFUL if a in arms])
+
+    def foot(pair, case_list) -> tuple[float, float]:
+        parts = [state_tokens(pair[1], pair[2], c, block_size, n_arms) for c in case_list]
+        return sum(g for g, _ in parts), sum(c for _, c in parts)
+
+    def fits(gpu: float, cpu: float) -> bool:
+        return ((gpu_budget is None or gpu <= gpu_budget)
+                and (cpu_budget is None or cpu <= cpu_budget))  # fmt: skip
+
+    units: list[list] = []  # [pairs, cases, gpu, cpu]
+    for pair in pairs:
+        chunks: list[list[str]] = []
+        for case in cases:
+            if chunks and fits(*foot(pair, chunks[-1] + [case])):
+                chunks[-1].append(case)
+            else:
+                chunks.append([case])
+        for chunk in chunks:
+            gpu, cpu = foot(pair, chunk)
+            last = units[-1] if units else None
+            if (last and last[1] == chunk and fits(last[2] + gpu, last[3] + cpu)
+                    and (max_sessions <= 0 or len(last[0]) < max_sessions)):  # fmt: skip
+                last[0].append(pair)
+                last[2] += gpu
+                last[3] += cpu
+            else:
+                units.append([[pair], chunk, gpu, cpu])
+    return [(u[0], u[1]) for u in units]
+
+
+def state_budgets(args: argparse.Namespace, url: str, level: int) -> tuple[float | None, float]:
+    """Tokens of GPU pool and CPU tier a unit's states may use. The GPU budget is
+    what A's pool holds beyond the AIPerf load's own blocks."""
+    metrics = scrape(url)
+    blocks, size = metrics.get("num_gpu_blocks"), metrics.get("block_size")
+    gpu = None
+    if blocks and size:
+        gpu = max(0.0, blocks * size - (h5.LOAD_TOKENS if level > 0 else 0)) * GPU_STATE_FRACTION
+    cpu = args.cpu_gb * 2**30 / args.bytes_per_token * CPU_STATE_FRACTION
+    return gpu, cpu
 
 
 def end_of_level(ctx: Ctx, info: dict) -> None:
@@ -724,14 +802,19 @@ def run_level(ctx: Ctx, level: int, measured, background, render, cases, arms) -
     dataset = write_dataset(ctx, level, background, render, info)
     pairs = [(n, prev, cur) for n, (prev, cur) in enumerate(measured)]
     a = AEngine(ctx.servers, random.Random(args.seed))
+    gpu_budget, cpu_budget = state_budgets(args, ctx.servers.producer, level)
+    units = plan_units(pairs, cases, arms, args.block_size, gpu_budget, cpu_budget,
+                       args.batch_sessions)  # fmt: skip
+    info["state_budget_tokens"] = {"gpu": gpu_budget, "cpu": cpu_budget}
+    info["units"] = [{"sessions": [n for n, _, _ in u[0]], "cases": u[1]} for u in units]
     records: list[dict] = []
     settles = []
     started_all = time.monotonic()
     with MetricsSampler(ctx.servers.producer, SAMPLE_INTERVAL_SECONDS) as sampler:
         ctx.sampler = sampler
-        for b, batch in enumerate(batches_of(pairs, args.batch_sessions)):
+        for b, (batch, unit_cases) in enumerate(units):
             try:
-                states = prepare_level(a, batch, cases, arms, level, ctx.nonce,
+                states = prepare_level(a, batch, unit_cases, arms, level, ctx.nonce,
                                        args.block_size, args.bytes_per_token)  # fmt: skip
                 load = level_load(ctx, level, dataset, f"{level}-{b}")
                 with (load or contextlib.nullcontext()) as active:
@@ -739,16 +822,19 @@ def run_level(ctx: Ctx, level: int, measured, background, render, cases, arms) -
                         settle = h5.wait_loaded(ctx.servers.producer, level, active)
                         settles.append(settle)
                         print(json.dumps({"level": level, "batch": b, **settle}), flush=True)
-                    for n, previous, current in batch:
-                        for case in cases:
-                            try:
-                                record = run_case(ctx, level, n, case, previous, current,
-                                                  states, arms)  # fmt: skip
-                            except (OSError, RuntimeError, ValueError, KeyError) as exc:
-                                record = {"level": level, "case": case, "session": n,
-                                          "error": repr(exc)}  # fmt: skip
-                            records.append(record)
-                            emit(ctx, record)
+                    # Least churn first: a measurement allocates on A (a copy, a load)
+                    # and would evict the states still waiting behind it.
+                    order = sorted(((c, n, prev, cur) for n, prev, cur in batch for c in unit_cases),
+                                   key=lambda x: (MEASURE_ORDER.index(x[0]), x[1]))  # fmt: skip
+                    for case, n, previous, current in order:
+                        try:
+                            record = run_case(ctx, level, n, case, previous, current,
+                                              states, arms)  # fmt: skip
+                        except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                            record = {"level": level, "case": case, "session": n,
+                                      "error": repr(exc)}  # fmt: skip
+                        records.append(record)
+                        emit(ctx, record)
             except (OSError, RuntimeError, ValueError) as exc:
                 # A batch that cannot be prepared or loaded costs its records, not the run.
                 record = {"level": level, "batch": b, "error": f"batch failed: {exc!r}"}
@@ -1310,8 +1396,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--arms", help=f"of {','.join(ARMS)}; the default depends on --part")
     p.add_argument("--traces", default=h4.DEFAULT_DATASET)
     p.add_argument("--sessions", type=int, default=10, help="measured sessions per level")
-    p.add_argument("--batch-sessions", type=int, default=2,
-                   help="sessions whose states are built (and measured) together; 0 = all")  # fmt: skip
+    p.add_argument("--batch-sessions", type=int, default=0,
+                   help="most sessions per unit; the units are sized to A's GPU pool and "
+                        "CPU tier (0 = no cap)")  # fmt: skip
+    p.add_argument("--cpu-gb", type=float, default=64.0,
+                   help="A's CPU offload tier in GiB (CPU_GB in h6_server.sh)")  # fmt: skip
     p.add_argument("--max-prompt-tokens", type=int, default=30000)
     p.add_argument("--background-pool", type=int, default=300)
     p.add_argument("--block-size", type=int, default=16)

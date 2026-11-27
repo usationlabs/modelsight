@@ -55,7 +55,7 @@ bench: >-
   --consumer-log $MS_RUN_DIR/rank-0/server-B.log
   --levels 32
   --sessions 10
-  --batch-sessions 2
+  --cpu-gb 64
   --score-rate "$PEER_STAGE_RATE"
   --max-prompt-tokens 30000
   --output skip/results.json

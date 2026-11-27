@@ -58,17 +58,17 @@ report:
 # Rank 0 is A, rank 1 is B; see h6_server.sh. Lines are tagged [A] or [B].
 server: PEER_STAGE_DEADLINE=1.5 PEER_STAGE_RATE=0 bash /opt/h6_server.sh
 
-# The container mounts modelsight at /root/modelsight. The probe runs on node 1 (B),
-# starts AIPerf against A at http://$MS_NODE0_IP:8100, and tails A's log through
-# rank 0's control endpoint. --batch-sessions keeps each batch's prepared GPU states
-# inside A's pool; a failed sweep does not stop the impact part.
+# The container mounts modelsight at /root/modelsight. The probe runs next to B and
+# starts AIPerf against A. --cpu-gb is A's CPU tier (CPU_GB): the probe sizes each
+# unit of prepared states to it and to A's GPU pool, so they are still on A when
+# measured. A failed sweep does not stop the impact part.
 bench: |
   PROBE="python -m modelsight.probes.kv_peer_stage_load --model Qwen/Qwen3-8B --no-rdma-gate"
   PROBE="$PROBE --producer http://$MS_NODE0_IP:8100 --consumer http://localhost:8200"
   PROBE="$PROBE --producer-log $MS_RUN_DIR/rank-0/server-A.log"
   PROBE="$PROBE --consumer-log $MS_RUN_DIR/rank-0/server-B.log"
   export PYTHONPATH=/root
-  $PROBE --part sweep --levels 0,8,16,32,64,128 --sessions 10 --batch-sessions 2 \
+  $PROBE --part sweep --levels 0,8,16,32,64,128 --sessions 10 --cpu-gb 64 \
       --max-prompt-tokens 30000 --output sweep/results.json
   sweep=$?
   $PROBE --part impact --levels 16,64 --sessions 10 --impact-interval 0.5 \

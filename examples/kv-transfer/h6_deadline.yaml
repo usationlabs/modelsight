@@ -56,7 +56,7 @@ bench: >-
   --consumer-log $MS_RUN_DIR/rank-0/server-B.log
   --levels 64
   --sessions 10
-  --batch-sessions 0
+  --cpu-gb 64
   --deadline-s "$PEER_STAGE_DEADLINE"
   --max-prompt-tokens 30000
   --output deadline/results.json
