@@ -1,0 +1,96 @@
+# Does a two-node Modal cluster really move data over RDMA? Run this before any H6
+# experiment: H6 is meaningless over tcp, and UCX falls back to tcp or shared
+# memory without a word.
+#
+# Rank 0 serves (ib_write_bw and ucx_perftest servers, UCX_PROTO_INFO=y); rank 1
+# runs the clients against it (MS_NODE0_IP) and then probes/rdma_gate.py over what
+# they printed. PASS needs an RDMA transport (rc_mlx5, dc_mlx5, rc_verbs, ...) in
+# UCX's data tables, none of tcp / sysv / posix / cuda_ipc / cma / knem, and at
+# least MIN_GBPS (50) Gb/s from both tools. The ucx_perftest check uses the apt UCX
+# of the image, not the UCX inside the nixl wheel that vLLM loads; `report` below
+# prints both (ucx_report.sh), and the H6 probe re-checks B's own UCX tables.
+#
+# No vLLM runs here. The image is H6's (Dockerfile.h6) so the smoke proves the
+# same RDMA userspace the benchmark uses; the vLLM tarball it needs is the
+# peer-stage one.
+#
+# GPU: H100. Modal documents RDMA clusters for H100-class GPUs; whether A100
+# nodes offer RDMA is unconfirmed, and M0 (the copy-latency baseline) was
+# measured on A100.
+#
+# Prepare once, with no GPU, from the repo root (re-run when the vLLM branch changes):
+#   examples/kv-transfer/prepare_local_vllm.sh /Users/bashorun/usation/vllm-peer-stage \
+#       3332daf8fe613c0e3d7c06f42b12e95eb450aa1e local_vllm_peer_stage.tar.gz
+#   uv run ms build -f examples/kv-transfer/rdma_smoke.yaml
+# Run, with streamed logs:
+#   uv run ms run -f examples/kv-transfer/rdma_smoke.yaml --detach
+target: modal
+gpu: H100
+nodes: 2
+# Without a secrets list the target asks for a named Modal secret; this run
+# needs no model, but the runtime still mounts one.
+secrets: [HF_TOKEN]
+rdma: true
+bench_rank: 1
+dockerfile: Dockerfile.h6
+sources:
+  VLLM:
+    repo: https://github.com/vllm-project/vllm
+    # upstream main 3332daf8fe, the base of the peer-stage tarball
+    ref: 3332daf8fe613c0e3d7c06f42b12e95eb450aa1e
+
+# Every rank serves a tiny HTTP page when its tools are up; the bench on rank 1
+# waits for both.
+ready_url: http://localhost:8300/
+ready_urls: ["http://{node0}:8300/"]
+ready_timeout: 10m
+timeout: 20m
+
+report:
+  - ibv_devinfo
+  - bash /opt/ucx_report.sh
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+
+# Rank 0 restarts the two servers after every client, so a failed attempt can be
+# retried. Logs: $MS_RANK_DIR/*.log (the run's rank-<r>/ folder).
+server: |
+  bash <<'EOF2'
+  mkdir -p /tmp/ready "$MS_RANK_DIR"
+  if [ "$MS_RANK" = 0 ]; then
+    export UCX_PROTO_INFO=y
+    IB_DEV=${IB_DEV:-$(ibv_devices | awk 'NR>2{print $1; exit}')}
+    echo "[smoke] ib device $IB_DEV"
+    ( while true; do ib_write_bw -d "$IB_DEV" -F --report_gbits -s 1048576 -D 10 -p 18515 $IB_ARGS; done \
+        2>&1 | tee -a "$MS_RANK_DIR/ib-server.log" | sed -u "s/^/[ib] /" ) &
+    ( while true; do stdbuf -oL ucx_perftest -p 13337; done \
+        2>&1 | tee -a "$MS_RANK_DIR/ucx-server.log" | sed -u "s/^/[ucx] /" ) &
+    sleep 3
+  fi
+  cd /tmp/ready && exec python -m http.server 8300 --bind 0.0.0.0
+  EOF2
+
+# The clients, with their output in $MS_RANK_DIR, then the gate. The perftest
+# test is ucp_get (what NIXL reads use), falling back to tag_bw if this UCX has
+# no such test name. MIN_GBPS: raise or lower the floor here.
+bench: |
+  bash <<'EOF2'
+  set -u
+  export UCX_PROTO_INFO=y PYTHONPATH=/root
+  D=$MS_RANK_DIR
+  IB_DEV=${IB_DEV:-$(ibv_devices | awk 'NR>2{print $1; exit}')}
+  echo "[bench] node0 $MS_NODE0_IP, ib device $IB_DEV"
+  for i in 1 2 3; do
+    ib_write_bw -d "$IB_DEV" -F --report_gbits -s 1048576 -D 10 -p 18515 ${IB_ARGS:-} \
+      "$MS_NODE0_IP" > "$D/ib-client.log" 2>&1 && break
+    echo "[bench] ib_write_bw attempt $i failed"; sleep 5
+  done
+  cat "$D/ib-client.log"
+  for test in ucp_get tag_bw; do
+    stdbuf -oL ucx_perftest "$MS_NODE0_IP" -p 13337 -t $test -m host -s 1048576 -n 5000 \
+      > "$D/ucx-client.log" 2>&1 && break
+    echo "[bench] ucx_perftest -t $test failed"; sleep 5
+  done
+  cat "$D/ucx-client.log"
+  python -m modelsight.probes.rdma_gate "$D/ib-client.log" "$D/ucx-client.log" \
+    --min-gbps "${MIN_GBPS:-50}" --require-bandwidth
+  EOF2
