@@ -75,8 +75,14 @@ serve() {
       2>&1 | tee "$LOG_DIR/server-$1.log" | sed -u "s/^/[$1] /"
 }
 
-if [ "$RANK" = 0 ]; then
-  STAGE="{\"peer_lookup\":true,\"peer_stage\":true,\"peer_stage_deadline\":${PEER_STAGE_DEADLINE:-1.5},\"peer_stage_recompute_tokens_per_s\":${PEER_STAGE_RATE:-0},\"peer_stage_max_fraction\":0.10}"
+STAGE="{\"peer_lookup\":true,\"peer_stage\":true,\"peer_stage_deadline\":${PEER_STAGE_DEADLINE:-1.5},\"peer_stage_recompute_tokens_per_s\":${PEER_STAGE_RATE:-0},\"peer_stage_max_fraction\":0.10}"
+if [ "${MS_NODES:-1}" = 1 ]; then
+  # One node, two GPUs (as H5): A on GPU 0, B on GPU 1. The run stops if
+  # either exits.
+  CUDA_VISIBLE_DEVICES=0 serve A 8100 5600 $(( ${CPU_GB:-64} * GIB )) "$STAGE" &
+  CUDA_VISIBLE_DEVICES=1 serve B 8200 5601 $(( ${CPU_GB_B:-32} * GIB )) '{"peer_lookup":true}' &
+  wait -n
+elif [ "$RANK" = 0 ]; then
   serve A 8100 5600 $(( ${CPU_GB:-64} * GIB )) "$STAGE"
 else
   serve B 8200 5601 $(( ${CPU_GB_B:-32} * GIB )) '{"peer_lookup":true}'

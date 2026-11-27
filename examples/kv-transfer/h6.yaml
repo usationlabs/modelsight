@@ -32,22 +32,19 @@
 # Run, with streamed logs (about 5 h at most; run rdma_smoke.yaml and h6_smoke.yaml first):
 #   uv run ms run -f examples/kv-transfer/h6.yaml --detach
 target: modal
-nodes: 2
-rdma: true
-gpu: H100
+gpu: A100-80GB:2
 dockerfile: Dockerfile.h6
 sources:
   VLLM:
     repo: https://github.com/vllm-project/vllm
     ref: 3332daf8fe613c0e3d7c06f42b12e95eb450aa1e
 secrets: [HF_TOKEN]
-bench_rank: 1
 
 cache:
   prefetch: [Qwen/Qwen3-8B]
 
 ready_url: http://localhost:8200/health
-ready_urls: ["http://{node0}:8100/health"]
+ready_urls: ["http://localhost:8100/health"]
 ready_timeout: 30m
 timeout: 5h
 
@@ -66,10 +63,10 @@ server: PEER_STAGE_DEADLINE=1.5 PEER_STAGE_RATE=0 bash /opt/h6_server.sh
 # rank 0's control endpoint. --batch-sessions keeps each batch's prepared GPU states
 # inside A's pool; a failed sweep does not stop the impact part.
 bench: |
-  PROBE="python -m modelsight.probes.kv_peer_stage_load --model Qwen/Qwen3-8B"
+  PROBE="python -m modelsight.probes.kv_peer_stage_load --model Qwen/Qwen3-8B --no-rdma-gate"
   PROBE="$PROBE --producer http://$MS_NODE0_IP:8100 --consumer http://localhost:8200"
-  PROBE="$PROBE --producer-log http://$MS_NODE0_IP:$MS_CONTROL_PORT/logs/server-A.log"
-  PROBE="$PROBE --consumer-log $MS_RUN_DIR/rank-1/server-B.log"
+  PROBE="$PROBE --producer-log $MS_RUN_DIR/rank-0/server-A.log"
+  PROBE="$PROBE --consumer-log $MS_RUN_DIR/rank-0/server-B.log"
   export PYTHONPATH=/root
   $PROBE --part sweep --levels 0,8,16,32,64,128 --sessions 10 --batch-sessions 2 \
       --max-prompt-tokens 30000 --output sweep/results.json

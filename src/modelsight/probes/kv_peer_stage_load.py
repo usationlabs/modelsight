@@ -1298,6 +1298,8 @@ def positive_float(text: str) -> float:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--model")
+    p.add_argument("--no-rdma-gate", action="store_true",
+                   help="single node: record B's read transports without requiring RDMA")
     p.add_argument("--producer", help="A's base URL, http://<node0 ip>:8100")
     p.add_argument("--consumer", help="B's base URL")
     p.add_argument("--producer-log", help="a path, or http://<node0 ip>:8399/logs/<name>")
@@ -1395,6 +1397,8 @@ def write_results(ctx: Ctx, results: dict, windows: list[dict], measured_n: int,
     good = [r for r in records if "error" not in r]
     level_infos = [o["info"] for o in results.values()]
     rdma = rdma_check(ctx.b_log.text())  # the read table so far
+    if ctx.args.no_rdma_gate:
+        rdma = {**rdma, "ok": None, "reason": "not checked (--no-rdma-gate)"}
     expects_staging = (args.part in ("sweep", "deadline") and "peer_stage" in arms
                        and any(c in CPU_CASES for c in cases))  # fmt: skip
     checks = check_records(good, level_infos, rdma, require_staged=expects_staging)
@@ -1451,7 +1455,11 @@ def main(argv: list[str] | None = None) -> int:
                     {"prompt": address_prompt, "kv_transfer_params": params})  # fmt: skip
     time.sleep(kv.METRICS_WAIT_SECONDS)
     rdma = rdma_check(b_log.text())
-    if not rdma["ok"]:
+    if args.no_rdma_gate:
+        # One node, two GPUs: reads go over NVLink (cuda_ipc), as in H5. Record
+        # the transports but do not judge them.
+        rdma = {**rdma, "ok": None, "reason": "not checked (--no-rdma-gate)"}
+    elif not rdma["ok"]:
         print(f"FAIL: rdma_path: {rdma['reason']} (transports: {rdma['transports']})", flush=True)
         args.output.write_text(json.dumps({"part": args.part, "checks": {"rdma_path": rdma}}, indent=2))
         return 1

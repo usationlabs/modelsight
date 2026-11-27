@@ -256,13 +256,15 @@ H6_YAMLS = sorted((ROOT / "examples" / "kv-transfer").glob("h6*.yaml"))
 
 
 @pytest.mark.parametrize("path", H6_YAMLS, ids=lambda p: p.name)
-def test_h6_yamls_load_as_two_node_rdma_runs(path: Path) -> None:
+def test_h6_yamls_load_as_single_node_two_gpu_runs(path: Path) -> None:
     experiment, _ = load_experiment(path)
 
-    assert (experiment.nodes, experiment.rdma, experiment.bench_rank_resolved) == (2, True, 1)
-    assert Path(experiment.dockerfile).name == "Dockerfile.h6" and experiment.gpu == "H100"
-    assert experiment.ready_urls == ("http://{node0}:8100/health",)
-    assert "kv_peer_stage_load" in experiment.bench and "/opt/h6_server.sh" in experiment.server
+    assert (experiment.nodes, experiment.rdma) == (1, False)
+    assert Path(experiment.dockerfile).name == "Dockerfile.h6"
+    assert experiment.gpu == "A100-80GB:2"
+    assert experiment.ready_urls == ("http://localhost:8100/health",)
+    assert "kv_peer_stage_load" in experiment.bench and "--no-rdma-gate" in experiment.bench
+    assert "/opt/h6_server.sh" in experiment.server
 
 
 def test_dockerfile_h6_provides_every_opt_path_the_h6_files_use() -> None:
