@@ -1,0 +1,48 @@
+# One vLLM install for the peer stage runs (peer_stage_e2e.yaml,
+# peer_stage_unit_tests.yaml): upstream main at VLLM_SHA with the files of the
+# local peer-stage worktree copied over it, from ./local_vllm_peer_stage.tar.gz
+# (examples/kv-transfer/prepare_local_vllm.sh, see the header of the experiment
+# files). The precompiled wheel of VLLM_SHA supplies the kernels, which match
+# because the branch changes Python only. VLLM_SHA is the base the archive was
+# diffed against, resolved from `sources` in the experiment file.
+#
+# Unlike Dockerfile.peer_lookup_compat there is no stock /opt/venv-main: no
+# "old engine" is needed here, and the build is one install shorter.
+FROM nvidia/cuda:13.2.1-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential curl ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/0.12.5/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh \
+    && uv venv /opt/venv --python 3.12 \
+    && uv pip install --python /opt/venv/bin/python pip
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN uv pip install --python /opt/venv/bin/python nixl==1.5.2 datasets \
+        pytest pytest-asyncio tblib ray
+
+ARG VLLM_REPO
+ARG VLLM_SHA
+RUN VLLM_USE_PRECOMPILED=1 uv pip install --python /opt/venv/bin/python \
+        "vllm @ git+${VLLM_REPO}@${VLLM_SHA}"
+
+# The branch's files over the install, and the tests beside them. The build
+# context is this directory, so run prepare_local_vllm.sh first. A change there
+# only rebuilds from here.
+COPY local_vllm_peer_stage.tar.gz /tmp/local_vllm.tar.gz
+RUN mkdir -p /tmp/local_vllm /opt/vllm-tests \
+    && tar -xzf /tmp/local_vllm.tar.gz -C /tmp/local_vllm \
+    && mv /tmp/local_vllm/tests /opt/vllm-tests/tests \
+    && cp /tmp/local_vllm/HEAD_SHA /opt/vllm-tests/HEAD_SHA \
+    && cp /tmp/local_vllm/BASE_SHA /tmp/BASE_SHA
+RUN test "$(cat /tmp/BASE_SHA)" = "${VLLM_SHA}" \
+    || { echo "overlay base $(cat /tmp/BASE_SHA) != VLLM_SHA ${VLLM_SHA}" >&2; exit 1; }
+RUN cp -r /tmp/local_vllm/vllm/. /opt/venv/lib/python3.12/site-packages/vllm/ \
+    && rm -rf /tmp/local_vllm /tmp/local_vllm.tar.gz
+
+# UCX error handling "none" for every Python process (Modal has no tcp/RDMA for
+# the default "peer" mode); the peer_stage_hook sitecustomize loads it too.
+COPY sitecustomize.py /opt/nixl-error-mode/sitecustomize.py

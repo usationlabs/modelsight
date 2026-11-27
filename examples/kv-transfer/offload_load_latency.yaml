@@ -1,0 +1,92 @@
+# SCRATCH, not committed. M0 of design/vllm/peer-pin-cpu-stage-fallback.md ("Job
+# shape: measure first"): how long does vLLM's OffloadingConnector take to load a
+# prefix from CPU back into GPU blocks, from the worker submitting the CPU->GPU
+# copy to the scheduler learning it finished? The answer decides whether a peer
+# stage (A copying the CPU-only tail of a prefix into GPU blocks before replying
+# to a peer) is one load job per pin or one per chunk. Rule: p99 submit-to-report
+# under 0.5 s for a ~10% of pool tail, while the engine is under load -> one job
+# per pin; otherwise per chunk.
+#
+# One engine, one A100-80GB, Qwen3-8B, stock upstream main 9df94b9977 (/opt/venv-main
+# of Dockerfile.peer_lookup_compat, so the image build is shared and cached; the
+# image also holds the local_vllm.tar.gz overlay layer, so run
+# prepare_local_vllm.sh only if that file is missing). OffloadingConnector with
+# kv_role kv_both and a 64 GiB CPU cache, prefix caching on.
+#
+# A CPU-only hit without a second engine: send a prompt (it is stored to CPU),
+# POST /reset_prefix_cache (GPU only, no reset_external), resend it. The probe
+# checks each resend loaded its bytes from CPU, or the rep does not count.
+#
+# Scenarios, for prefixes of 4k, 8k, 16k and 32k tokens, 20 valid reps each:
+# idle; loaded (12 long decodes and 4 loops of unique 8k prompts, which keep the
+# engine at ~16 running and storing to CPU); and 3 x 32k CPU hits submitted at
+# once under the same load.
+#
+# The submit and report times come from probes/offload_latency_hook/sitecustomize.py,
+# on PYTHONPATH of the server: it wraps CPUOffloadingWorker.submit_load and
+# .get_finished and OffloadingConnectorScheduler._update_connector_output, and
+# fails the server at startup if any is missing. It needs worker and scheduler in
+# one process, hence --distributed-executor-backend uni. Lines are tagged
+# [LOADLAT] in the server log; the probe reads the jobs file the hook writes.
+# The probe prints a table and "M0 verdict: one job per pin" or "per chunk".
+#
+# ms has no memory setting for the Modal container; 64 GiB of pinned host memory
+# relies on the A100-80GB container having that much. Lower CPU_BYTES below and
+# --max-batch-prompts in the bench if the server dies at startup.
+#
+# Prepare, with no GPU (nothing to prepare if local_vllm.tar.gz exists):
+#   uv run ms build -f examples/kv-transfer/offload_load_latency.yaml
+# Run, with streamed logs:
+#   uv run ms run -f examples/kv-transfer/offload_load_latency.yaml --detach
+target: modal
+gpu: A100-80GB
+dockerfile: Dockerfile.peer_lookup_compat
+sources:
+  VLLM:
+    repo: https://github.com/vllm-project/vllm
+    # upstream main 9df94b9977, the same as peer_lookup_compat.yaml
+    ref: 9df94b99774f1a0e17716f26dbb4eac50cc66f7a
+secrets: [HF_TOKEN]
+
+cache:
+  prefetch: [Qwen/Qwen3-8B]
+
+ready_url: http://localhost:8000/health
+ready_timeout: 20m
+timeout: 2h
+
+report:
+  - /opt/venv-main/bin/pip list 2>/dev/null | grep -i -E '^vllm '
+  - nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+  - free -g
+  - nproc
+
+# --max-model-len leaves room for a 32768 token prompt plus its output.
+# --distributed-executor-backend uni keeps worker and scheduler in one process.
+# The default block size and one block per CPU chunk are left as they are.
+server: |
+  export VLLM_SERVER_DEV_MODE=1
+  export OFFLOAD_LATENCY_LOG=/tmp/offload_load_jobs.jsonl
+  rm -f $OFFLOAD_LATENCY_LOG
+  CPU_BYTES=68719476736   # 64 GiB: holds every prompt of a batch plus the background's
+  PYTHONPATH=/root/modelsight/probes/offload_latency_hook stdbuf -oL \
+    /opt/venv-main/bin/vllm serve Qwen/Qwen3-8B \
+      --port 8000 \
+      --max-model-len 33792 \
+      --gpu-memory-utilization 0.9 \
+      --max-num-seqs 64 \
+      --enable-prefix-caching \
+      --distributed-executor-backend uni \
+      --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$CPU_BYTES}}" \
+      2>&1 | tee /tmp/server.log
+
+# The container mounts modelsight at /root/modelsight.
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_offload_latency
+  --model Qwen/Qwen3-8B
+  --url http://localhost:8000
+  --server-log /tmp/server.log
+  --jobs-file /tmp/offload_load_jobs.jsonl
+  --sizes 4096,8192,16384,32768
+  --reps 20
+  --concurrent 3
