@@ -8,6 +8,7 @@ import pytest
 
 from modelsight.build import install_commands, prepare
 from modelsight.config import Cache, Experiment, Source
+from modelsight.runner import RunError
 from modelsight.runs import RunState, load_state
 from modelsight.targets import modal as target
 
@@ -279,7 +280,8 @@ def test_cluster_rank_and_ips_prefer_ipv4(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(modal.experimental, "get_cluster_info", lambda: info)
     assert target.cluster_rank_and_ips() == (1, ["10.0.0.1", "10.0.0.2"])
     info.container_ipv4_ips = []
-    assert target.cluster_rank_and_ips() == (1, ["fd00::1", "fd00::2"])
+    with pytest.raises(RunError, match="IPv4"):  # no fallback to the IPv6 list
+        target.cluster_rank_and_ips()
 
 
 def test_a_detached_run_is_spawned_and_remembered(

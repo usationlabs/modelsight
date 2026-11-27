@@ -38,7 +38,8 @@ COMMIT_TIMEOUT_SECONDS = 180
 # A non-bench rank gives up once the bench rank has not answered for this long.
 PEER_LOST_SECONDS = 120
 # After it finishes, a rank waits at most this long for the others to see it.
-LINGER_SECONDS = 30
+LINGER_SECONDS = 200  # covers the other ranks' commit (COMMIT_TIMEOUT_SECONDS)
+COMMIT_WAIT_SECONDS = 240  # the bench rank's volume commit, from rank 0's side
 
 
 class RunError(Exception):
@@ -145,6 +146,8 @@ def execute_cluster_run(
     control_ports: Sequence[int] | None = None,
     peer_lost_seconds: float = PEER_LOST_SECONDS,
     linger_seconds: float = LINGER_SECONDS,
+    finalize: Callable[[], None] | None = None,
+    commit_wait_seconds: float = COMMIT_WAIT_SECONDS,
 ) -> None:
     """One rank of a cluster run. Every rank of the cluster calls this.
 
@@ -155,6 +158,11 @@ def execute_cluster_run(
     for `peer_lost_seconds`. A server that exits early fails its rank, and the
     other ranks stop when they see that. `control_ports` (one per rank) exist so
     a test can run two ranks on one host.
+
+    After a successful run every rank calls `finalize` (the volume commit) and then
+    reports `committed`. A rank that is not the bench rank returns only once the
+    bench rank has reported `committed` too (or `commit_wait_seconds` pass), so the
+    client does not download results before the bench rank's files are committed.
     """
     nodes = len(ips)
     if nodes != exp.nodes:
@@ -197,12 +205,18 @@ def execute_cluster_run(
         print("stopping server", flush=True)
         stop_process(server)
         server_log.close()
+        if control.state == "done":
+            if finalize is not None:
+                finalize()
+            control.set("committed")
+            if not is_bench:
+                _wait_peer_committed(ips[bench_rank], ports[bench_rank], commit_wait_seconds)
         if is_bench:
-            # Stay reachable until the other ranks have seen done or failed.
+            # Stay reachable until the other ranks have committed or failed.
             _linger(control, [(ips[r], ports[r]) for r in others], linger_seconds)
         elif control.state == "failed":
             _linger_until(lambda: peer_state(ips[bench_rank], ports[bench_rank], 1)
-                          in (None, "done", "failed"), linger_seconds)  # fmt: skip
+                          in (None, "committed", "failed"), linger_seconds)  # fmt: skip
         control.stop()
 
 
@@ -262,7 +276,7 @@ def _serving_rank(exp, server, rank_dir, deadline, bench_at, peer_lost_seconds) 
         state = peer_state(ip, port, 2)
         if state is not None:
             last_seen = now
-        if state == "done":
+        if state in ("done", "committed"):
             print("the bench rank is done", flush=True)
             return
         if state == "failed":
@@ -274,9 +288,24 @@ def _serving_rank(exp, server, rank_dir, deadline, bench_at, peer_lost_seconds) 
 
 def _linger(control: ControlServer, peers: list[tuple[str, int]], seconds: float) -> None:
     def all_seen() -> bool:
-        return all(peer_state(ip, port, 1) in (None, "done", "failed") for ip, port in peers)
+        return all(peer_state(ip, port, 1) in (None, "committed", "failed") for ip, port in peers)
 
     _linger_until(all_seen, seconds)
+
+
+def _wait_peer_committed(ip: str, port: int, seconds: float) -> bool:
+    """Wait (bounded) until the bench rank reports committed or failed."""
+    seen: list[str | None] = []
+
+    def ready() -> bool:
+        seen[:] = [peer_state(ip, port, 1)]
+        return seen[0] in ("committed", "failed")
+
+    _linger_until(ready, seconds)
+    if not ready():
+        print(f"warning: the bench rank had not committed after {seconds:g}s; going on", flush=True)
+        return False
+    return True
 
 
 def _linger_until(done: Callable[[], bool], seconds: float) -> None:

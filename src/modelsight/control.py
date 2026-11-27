@@ -1,6 +1,6 @@
 """A tiny HTTP endpoint on every rank of a cluster run.
 
-  GET /status                    {"rank": r, "state": "starting|serving|running_bench|done|failed"}
+  GET /status                    {"rank": r, "state": "starting|serving|running_bench|done|committed|failed"}
   GET /logs/<name>?offset=<n>    bytes of run_dir/rank-<r>/<name> from byte n
 
 The bench rank reads the other ranks' state from it, and they read the bench
@@ -21,7 +21,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 DEFAULT_PORT = 8399
-STATES = ("starting", "serving", "running_bench", "done", "failed")
+STATES = ("starting", "serving", "running_bench", "done", "committed", "failed")
 _LOG_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
 

@@ -301,7 +301,8 @@ sys.exit({bench_status})
 """
 
 
-def _cluster(tmp_path: Path, die_rank: int = -1, bench_status: int = 0):
+def _cluster(tmp_path: Path, die_rank: int = -1, bench_status: int = 0,
+             commits: dict | None = None, slow_commit_rank: int = -1):
     p0, p1, c0, c1 = (_free_port() for _ in range(4))
     server = tmp_path / "server.py"
     bench = tmp_path / "bench.py"
@@ -326,8 +327,15 @@ bench: "{sys.executable} {bench}"
 
     def rank(r: int) -> None:
         try:
+            def finalize() -> None:
+                if r == slow_commit_rank:
+                    time.sleep(1.5)  # a slow volume commit
+                if commits is not None:
+                    commits[r] = time.monotonic()
+
             execute_cluster_run(experiment, run_dir, text, r, ["127.0.0.1"] * 2,
-                                control_ports=[c0, c1], linger_seconds=5)  # fmt: skip
+                                control_ports=[c0, c1], linger_seconds=5,
+                                finalize=finalize, commit_wait_seconds=10)  # fmt: skip
             errors[r] = None
         except BaseException as exc:  # noqa: BLE001 - checked by the test
             errors[r] = exc
@@ -355,6 +363,17 @@ def test_cluster_rank_0_serves_until_the_bench_rank_is_done(tmp_path: Path) -> N
         assert (run_dir / f"rank-{r}" / "env.txt").read_text().startswith(f"rank: {r} of 2")
         _assert_dead(int((run_dir / f"rank-{r}" / "pid").read_text()))
     assert (run_dir / "bench.log").exists() and (run_dir / "exp.yaml").exists()
+
+
+def test_rank_0_returns_only_after_the_bench_rank_has_committed(tmp_path: Path) -> None:
+    commits: dict[int, float] = {}
+
+    _, errors, finished = _cluster(tmp_path, commits=commits, slow_commit_rank=1)
+
+    assert errors == {0: None, 1: None} and set(commits) == {0, 1}
+    # the bench rank's commit is slow, and rank 0 (whose own commit is quick) waited
+    assert finished[0] >= commits[1]
+    assert commits[0] < commits[1]
 
 
 def test_a_server_that_dies_on_rank_0_fails_both_ranks(tmp_path: Path) -> None:

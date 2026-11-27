@@ -45,13 +45,18 @@ def cluster_decorator(size: int, rdma: bool):
 def cluster_rank_and_ips() -> tuple[int, list[str]]:
     """This container's rank and every container's IP, inside a clustered call.
 
-    IPv4 where Modal gives it (NIXL's side channel and UCX's sockaddr use it),
-    else the default (IPv6) list.
+    IPv4 only (NIXL's side channel and UCX's sockaddr use it): an empty list raises,
+    with no fallback to the IPv6 list.
     """
     import modal.experimental
 
     info = modal.experimental.get_cluster_info()
-    ips = list(getattr(info, "container_ipv4_ips", None) or info.container_ips)
+    ips = list(getattr(info, "container_ipv4_ips", None) or [])
+    if not ips:
+        raise RunError(
+            "Modal gave this cluster no IPv4 container addresses (container_ipv4_ips is "
+            "empty); NIXL's side channel and UCX need IPv4, so the run cannot continue"
+        )
     return int(info.rank), ips
 
 
@@ -285,23 +290,35 @@ def run(
 
         experiment = experiment_from_mapping(mapping)
         run_dir = Path(RESULTS_MOUNT) / run_name
+        committed: list[bool] = []
+
+        def commit_all() -> None:
+            # The results first, then the cache. Each commit is bounded and timed so
+            # a slow one cannot keep the GPUs idle once the run is over. Once only.
+            if committed:
+                return
+            committed.append(True)
+            for label, mounted in (("results", volume), ("cache", cache_volume)):
+                if mounted is not None:
+                    commit_with_timeout(label, mounted)
+
         try:
             if experiment.clustered:
                 # Every rank gets the same call (inputs are broadcast).
                 from modelsight.targets.modal import cluster_rank_and_ips
 
                 rank, ips = cluster_rank_and_ips()
+                # finalize commits before the rank reports `committed`, and rank 0
+                # returns only after the bench rank has, so the client's download
+                # (after the call returns) sees every rank's files.
                 execute_cluster_run(
-                    experiment, run_dir, config_text, rank, ips, extra_env=info_text
+                    experiment, run_dir, config_text, rank, ips, extra_env=info_text,
+                    finalize=commit_all,
                 )
             else:
                 execute_run(experiment, run_dir, config_text, extra_env=info_text)
         finally:
-            # The results first, then the cache. Each commit is bounded and timed so
-            # a slow one cannot keep the GPUs idle once the run is over.
-            for label, mounted in (("results", volume), ("cache", cache_volume)):
-                if mounted is not None:
-                    commit_with_timeout(label, mounted)
+            commit_all()
 
     if exp.clustered:
         # Applied below app.function, as Modal requires.
