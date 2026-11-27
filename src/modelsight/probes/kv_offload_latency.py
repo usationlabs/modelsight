@@ -83,7 +83,12 @@ class Client:
             ).encode(),
             headers={"Content-Type": "application/json"},
         )
-        return urllib.request.urlopen(request, timeout=timeout)
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            # The server's reason is in the body; without it a 400 says nothing.
+            detail = exc.read().decode(errors="replace")[:2000]
+            raise RuntimeError(f"{self.url} returned {exc.code}: {detail}") from exc
 
     def ttft(self, prompt: list[int]) -> float:
         """Seconds to the first streamed token of a 1-token completion."""
