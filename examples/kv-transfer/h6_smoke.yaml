@@ -1,0 +1,57 @@
+# H6 smoke: the whole H6 path at levels 0 and 32 with 2 sessions, all cases and
+# arms, before the full sweep. It checks the RDMA gate, discovery of A's node IP,
+# the log parsers against real vLLM lines, the AIPerf start and settle gate, and
+# that a record has every field. Same engines as h6.yaml (see its header).
+#
+# The vLLM build is the local feat/nixl-peer-stage worktree: prepare_local_vllm.sh packs
+# the files that differ from upstream main 3332daf8fe into local_vllm_peer_stage.tar.gz
+# (gitignored), which Dockerfile.h6 lays over that commit's precompiled install.
+# Dockerfile.h6 also copies h6_server.sh to /opt/h6_server.sh.
+#
+# Prepare, with no GPU, from the repo root:
+#   examples/kv-transfer/prepare_local_vllm.sh /Users/bashorun/usation/vllm-peer-stage \
+#       3332daf8fe613c0e3d7c06f42b12e95eb450aa1e local_vllm_peer_stage.tar.gz
+#   uv run ms build -f examples/kv-transfer/h6_smoke.yaml
+# Run, with streamed logs (about 45 min):
+#   uv run ms run -f examples/kv-transfer/h6_smoke.yaml --detach
+target: modal
+nodes: 2
+rdma: true
+gpu: H100
+dockerfile: Dockerfile.h6
+sources:
+  VLLM:
+    repo: https://github.com/vllm-project/vllm
+    ref: 3332daf8fe613c0e3d7c06f42b12e95eb450aa1e
+secrets: [HF_TOKEN]
+bench_rank: 1
+
+cache:
+  prefetch: [Qwen/Qwen3-8B]
+
+ready_url: http://localhost:8200/health
+ready_urls: ["http://{node0}:8100/health"]
+ready_timeout: 30m
+timeout: 90m
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch) '
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - ibv_devinfo || true
+
+server: PEER_STAGE_DEADLINE=1.5 PEER_STAGE_RATE=0 CPU_GB=100 bash /opt/h6_server.sh
+
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_peer_stage_load
+  --part sweep
+  --model Qwen/Qwen3-8B
+  --producer http://$MS_NODE0_IP:8100
+  --consumer http://localhost:8200
+  --producer-log http://$MS_NODE0_IP:$MS_CONTROL_PORT/logs/server-A.log
+  --consumer-log $MS_RUN_DIR/rank-1/server-B.log
+  --levels 0,32
+  --sessions 2
+  --batch-sessions 0
+  --max-prompt-tokens 30000
+  --level-seconds 600
+  --output smoke/results.json

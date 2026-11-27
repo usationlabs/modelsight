@@ -1,0 +1,64 @@
+# H6 part B: does A's skip rule pick the right side of the break-even?
+#
+# One busy level (32) with the rule on in A: A skips a copy when its estimate
+# (2 x step EMA + bytes / 20 GB/s) exceeds the deadline or the tail's recompute time
+# at peer_stage_recompute_tokens_per_s. The probe scores each live decision
+# (skipped vs staged) against the peer arm and an unskipped estimate.
+#
+# Set the rate from part A: the 'break-even' and 'skip rule (offline)' lines of
+# the h6.yaml sweep show which rate scores best (--score-rate sweeps it offline).
+# Pass it in the environment; it reaches both nodes as a secret:
+#   PEER_STAGE_RATE=<tokens/s> uv run ms run -f examples/kv-transfer/h6_skip.yaml --detach
+#
+# The vLLM build is the local feat/nixl-peer-stage worktree: prepare_local_vllm.sh packs
+# the files that differ from upstream main 3332daf8fe into local_vllm_peer_stage.tar.gz
+# (gitignored), which Dockerfile.h6 lays over that commit's precompiled install.
+# Dockerfile.h6 also copies h6_server.sh to /opt/h6_server.sh.
+#
+# Prepare, with no GPU, from the repo root:
+#   examples/kv-transfer/prepare_local_vllm.sh /Users/bashorun/usation/vllm-peer-stage \
+#       3332daf8fe613c0e3d7c06f42b12e95eb450aa1e local_vllm_peer_stage.tar.gz
+#   (the image is h6.yaml's: build it there with `uv run ms build -f examples/kv-transfer/h6.yaml`)
+# Run (about 40 min), after h6.yaml:
+#   PEER_STAGE_RATE=10000 uv run ms run -f examples/kv-transfer/h6_skip.yaml --detach
+target: modal
+nodes: 2
+rdma: true
+gpu: H100
+dockerfile: Dockerfile.h6
+sources:
+  VLLM:
+    repo: https://github.com/vllm-project/vllm
+    ref: 3332daf8fe613c0e3d7c06f42b12e95eb450aa1e
+secrets: [HF_TOKEN, PEER_STAGE_RATE]
+bench_rank: 1
+
+cache:
+  prefetch: [Qwen/Qwen3-8B]
+
+ready_url: http://localhost:8200/health
+ready_urls: ["http://{node0}:8100/health"]
+ready_timeout: 30m
+timeout: 2h
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch) '
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - echo "PEER_STAGE_RATE=$PEER_STAGE_RATE"
+
+server: PEER_STAGE_DEADLINE=1.5 bash /opt/h6_server.sh
+
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_peer_stage_load
+  --part skip
+  --model Qwen/Qwen3-8B
+  --producer http://$MS_NODE0_IP:8100
+  --consumer http://localhost:8200
+  --producer-log http://$MS_NODE0_IP:$MS_CONTROL_PORT/logs/server-A.log
+  --consumer-log $MS_RUN_DIR/rank-1/server-B.log
+  --levels 32
+  --sessions 10
+  --batch-sessions 2
+  --score-rate "$PEER_STAGE_RATE"
+  --max-prompt-tokens 30000
+  --output skip/results.json

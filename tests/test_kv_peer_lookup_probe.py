@@ -43,6 +43,9 @@ class FakeVllm:
         self.leak = False
         self.serve_peer = False
         self.wrong_tokens = False
+        self.event_sources: dict = {}  # served on /kv_event_sources
+        self.block_size = BLOCK  # on vllm:cache_config_info
+        self.store_bytes = 0  # vllm:kv_offload_store_bytes_total
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -57,6 +60,9 @@ class FakeVllm:
             def do_GET(self) -> None:
                 if self.path == "/health":
                     self._reply(b"")
+                    return
+                if self.path == "/kv_event_sources":
+                    self._reply(json.dumps(fake.event_sources).encode())
                     return
                 self._reply(fake.metrics().encode())
 
@@ -140,6 +146,8 @@ class FakeVllm:
         return (
             f"vllm:num_requests_running {running}\n"
             "vllm:num_requests_waiting 0\n"
+            f"vllm:kv_offload_store_bytes_total {self.store_bytes}\n"
+            f'vllm:cache_config_info{{block_size="{self.block_size}",num_gpu_blocks="100"}} 1\n'
             f'vllm:nixl_bytes_transferred_count{{m="q"}} {self.transfers}\n'
             f'vllm:nixl_bytes_transferred_sum{{m="q"}} {self.bytes}\n'
             f'vllm:request_success_total{{m="q",reason="stop"}} {self.served}\n'

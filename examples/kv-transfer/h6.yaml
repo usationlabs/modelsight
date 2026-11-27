@@ -1,0 +1,80 @@
+# H6: does staging A's CPU-only blocks pay off under load, over RDMA?
+#
+# vLLM's peer stage (design: handoff/peer-pin-cpu-stage-fallback.md): when part of a
+# prefix a peer asks for sits only in A's CPU offload tier, A copies it into fresh
+# GPU blocks before it replies, so B reads it over NIXL. A trims back to the GPU
+# part when the copy misses a deadline, and can skip the copy when B would compute
+# those tokens faster. H5 measured the GPU-only peer pin under load, but inside one
+# host over NVLink. Here A (node 0) and B (node 1) have one H100 each and NIXL reads
+# cross InfiniBand/RoCE; the probe fails the run unless B's UCX table shows an RDMA
+# transport. M0, the copy-latency baseline, was measured on A100.
+#
+# Per load level N (AIPerf agent sessions on A; 0, 8, 16, 32, 64, 128), the probe
+# builds each case's state on A while A is idle (every CPU state, one GPU-only
+# prefix-cache reset, then the GPU states), starts AIPerf, waits until A runs about
+# min(N, 16) requests and measures:
+#   cases  gpu, partial, cpu, cpu_tail, miss  (classified by what A's log says it did)
+#   arms   recompute, stock, peer (staging opted out per request), peer_stage, on_a
+# The skip rule is off here, so every CPU case is staged and its cost measured.
+# A second probe run (--part impact) sends B's cpu-case lookups at levels 16 and 64
+# with staging off, then on, and compares AIPerf's TTFT and ITL on A.
+# Results: sweep/results.json (+ records.jsonl) and impact/results.json in the run.
+#
+# The vLLM build is the local feat/nixl-peer-stage worktree: prepare_local_vllm.sh packs
+# the files that differ from upstream main 3332daf8fe into local_vllm_peer_stage.tar.gz
+# (gitignored), which Dockerfile.h6 lays over that commit's precompiled install.
+# Dockerfile.h6 also copies h6_server.sh to /opt/h6_server.sh.
+#
+# Prepare, with no GPU, from the repo root (re-run when the vLLM branch changes):
+#   examples/kv-transfer/prepare_local_vllm.sh /Users/bashorun/usation/vllm-peer-stage \
+#       3332daf8fe613c0e3d7c06f42b12e95eb450aa1e local_vllm_peer_stage.tar.gz
+#   uv run ms build -f examples/kv-transfer/h6.yaml
+# Run, with streamed logs (about 5 h at most; run rdma_smoke.yaml and h6_smoke.yaml first):
+#   uv run ms run -f examples/kv-transfer/h6.yaml --detach
+target: modal
+nodes: 2
+rdma: true
+gpu: H100
+dockerfile: Dockerfile.h6
+sources:
+  VLLM:
+    repo: https://github.com/vllm-project/vllm
+    ref: 3332daf8fe613c0e3d7c06f42b12e95eb450aa1e
+secrets: [HF_TOKEN]
+bench_rank: 1
+
+cache:
+  prefetch: [Qwen/Qwen3-8B]
+
+ready_url: http://localhost:8200/health
+ready_urls: ["http://{node0}:8100/health"]
+ready_timeout: 30m
+timeout: 5h
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch) '
+  - cat /opt/vllm-tests/HEAD_SHA
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - ibv_devinfo || true
+  - free -g
+
+# Rank 0 is A, rank 1 is B; see h6_server.sh. Lines are tagged [A] or [B].
+server: PEER_STAGE_DEADLINE=1.5 PEER_STAGE_RATE=0 bash /opt/h6_server.sh
+
+# The container mounts modelsight at /root/modelsight. The probe runs on node 1 (B),
+# starts AIPerf against A at http://$MS_NODE0_IP:8100, and tails A's log through
+# rank 0's control endpoint. --batch-sessions keeps each batch's prepared GPU states
+# inside A's pool; a failed sweep does not stop the impact part.
+bench: |
+  PROBE="python -m modelsight.probes.kv_peer_stage_load --model Qwen/Qwen3-8B"
+  PROBE="$PROBE --producer http://$MS_NODE0_IP:8100 --consumer http://localhost:8200"
+  PROBE="$PROBE --producer-log http://$MS_NODE0_IP:$MS_CONTROL_PORT/logs/server-A.log"
+  PROBE="$PROBE --consumer-log $MS_RUN_DIR/rank-1/server-B.log"
+  export PYTHONPATH=/root
+  $PROBE --part sweep --levels 0,8,16,32,64,128 --sessions 10 --batch-sessions 2 \
+      --max-prompt-tokens 30000 --output sweep/results.json
+  sweep=$?
+  $PROBE --part impact --levels 16,64 --sessions 10 --impact-interval 0.5 \
+      --impact-seconds 180 --max-prompt-tokens 30000 --output impact/results.json
+  impact=$?
+  exit $((sweep | impact))

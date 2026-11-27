@@ -250,3 +250,32 @@ def test_bench_rank_defaults_to_the_last_node_and_placeholders_resolve(tmp_path:
     experiment, _ = _load(tmp_path, MODAL_BASE + "nodes: 3\nready_url: http://{node2}:1/\n")
     assert experiment.bench_rank is None and experiment.bench_rank_resolved == 2
     assert resolve_nodes(experiment.ready_url, ["a", "b", "10.0.0.3"]) == "http://10.0.0.3:1/"
+
+
+H6_YAMLS = sorted((ROOT / "examples" / "kv-transfer").glob("h6*.yaml"))
+
+
+@pytest.mark.parametrize("path", H6_YAMLS, ids=lambda p: p.name)
+def test_h6_yamls_load_as_two_node_rdma_runs(path: Path) -> None:
+    experiment, _ = load_experiment(path)
+
+    assert (experiment.nodes, experiment.rdma, experiment.bench_rank_resolved) == (2, True, 1)
+    assert Path(experiment.dockerfile).name == "Dockerfile.h6" and experiment.gpu == "H100"
+    assert experiment.ready_urls == ("http://{node0}:8100/health",)
+    assert "kv_peer_stage_load" in experiment.bench and "/opt/h6_server.sh" in experiment.server
+
+
+def test_dockerfile_h6_provides_every_opt_path_the_h6_files_use() -> None:
+    import re
+
+    kv = ROOT / "examples" / "kv-transfer"
+    dockerfile = (kv / "Dockerfile.h6").read_text()
+    used = set()
+    for path in [*H6_YAMLS, kv / "h6_server.sh"]:
+        used |= set(re.findall(r"/opt/[A-Za-z0-9_/-]+(?:\.[A-Za-z0-9_]+)*", path.read_text()))
+    assert "/opt/h6_server.sh" in used
+    missing = sorted(p for p in used if p not in dockerfile)
+    assert not missing, f"Dockerfile.h6 never mentions {missing}"
+    # a path the image gets from a COPY must have its source in the build context
+    for source, dest in re.findall(r"^COPY (\S+) (/opt/\S+)", dockerfile, re.M):
+        assert (kv / source).exists() or source.endswith(".tar.gz"), source

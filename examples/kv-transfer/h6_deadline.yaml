@@ -1,0 +1,65 @@
+# H6 part D: how often does the deadline trim, and what does a trim cost B?
+#
+# Level 64, the cpu case, peer_stage and peer arms only, with A's
+# peer_stage_deadline taken from the environment (0.5, 1.0 and 1.5 s). One run per
+# deadline: the value reaches both nodes as a secret, and the probe labels its
+# results with it. Run it three times, then merge the three results into Table 4:
+#   for d in 0.5 1.0 1.5; do
+#     PEER_STAGE_DEADLINE=$d uv run ms run -f examples/kv-transfer/h6_deadline.yaml
+#   done
+#   uv run python -m modelsight.probes.kv_peer_stage_load \
+#       --merge results/<run-0.5>/deadline/results.json \
+#               results/<run-1.0>/deadline/results.json \
+#               results/<run-1.5>/deadline/results.json --output deadline-merged.json
+#
+# The vLLM build is the local feat/nixl-peer-stage worktree: prepare_local_vllm.sh packs
+# the files that differ from upstream main 3332daf8fe into local_vllm_peer_stage.tar.gz
+# (gitignored), which Dockerfile.h6 lays over that commit's precompiled install.
+# Dockerfile.h6 also copies h6_server.sh to /opt/h6_server.sh.
+#
+# Prepare, with no GPU, from the repo root:
+#   examples/kv-transfer/prepare_local_vllm.sh /Users/bashorun/usation/vllm-peer-stage \
+#       3332daf8fe613c0e3d7c06f42b12e95eb450aa1e local_vllm_peer_stage.tar.gz
+#   (the image is h6.yaml's: build it there with `uv run ms build -f examples/kv-transfer/h6.yaml`)
+# One run takes about 30 min. The skip rule is off, so every cpu request is staged.
+target: modal
+nodes: 2
+rdma: true
+gpu: H100
+dockerfile: Dockerfile.h6
+sources:
+  VLLM:
+    repo: https://github.com/vllm-project/vllm
+    ref: 3332daf8fe613c0e3d7c06f42b12e95eb450aa1e
+secrets: [HF_TOKEN, PEER_STAGE_DEADLINE]
+bench_rank: 1
+
+cache:
+  prefetch: [Qwen/Qwen3-8B]
+
+ready_url: http://localhost:8200/health
+ready_urls: ["http://{node0}:8100/health"]
+ready_timeout: 30m
+timeout: 90m
+
+report:
+  - pip list 2>/dev/null | grep -i -E '^(vllm|nixl|torch) '
+  - nvidia-smi --query-gpu=name,driver_version --format=csv
+  - echo "PEER_STAGE_DEADLINE=$PEER_STAGE_DEADLINE"
+
+server: PEER_STAGE_RATE=0 bash /opt/h6_server.sh
+
+bench: >-
+  PYTHONPATH=/root python -m modelsight.probes.kv_peer_stage_load
+  --part deadline
+  --model Qwen/Qwen3-8B
+  --producer http://$MS_NODE0_IP:8100
+  --consumer http://localhost:8200
+  --producer-log http://$MS_NODE0_IP:$MS_CONTROL_PORT/logs/server-A.log
+  --consumer-log $MS_RUN_DIR/rank-1/server-B.log
+  --levels 64
+  --sessions 10
+  --batch-sessions 0
+  --deadline-s "$PEER_STAGE_DEADLINE"
+  --max-prompt-tokens 30000
+  --output deadline/results.json
